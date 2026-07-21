@@ -22,7 +22,7 @@ paths so that only the residual mechanism changes across comparisons.
 ## Checkpoint
 
 DAR weights are available on Hugging Face Hub as
-`moddells/dual-attentions-residuals-60k`.
+[`moddells/dual-attentions-residuals-60k`](https://huggingface.co/moddells/dual-attentions-residuals-60k).
 
 ## Quick start
 
