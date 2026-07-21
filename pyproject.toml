@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dual_attentions_residuals"
+version = "0.1.0"
+description = "Minimal Megatron-Core training code for Dual Attention Residuals."
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+license = { text = "MIT" }
+dependencies = [
+  "torch==2.10.0",
+  "megatron-core==0.16.1",
+  "transformer-engine[pytorch]==2.10.0",
+  "triton==3.6.0",
+  "numpy==1.26.4",
+  "PyYAML==6.0.3",
+  "sentencepiece==0.2.1",
+  "datasets==5.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["dual_attentions_residuals*", "data*"]

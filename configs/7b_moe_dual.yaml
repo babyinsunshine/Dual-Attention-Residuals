@@ -1,0 +1,50 @@
+model:
+  variant: dual_attention_residual_block
+  seq_length: 4096
+  vocab_size: 131072
+  hidden_size: 2048
+  ffn_hidden_size: 704
+  num_layers: 24
+  num_attention_heads: 16
+  num_query_groups: 8
+  attention_backend: fused
+  position_embedding_type: rope
+  rotary_base: 1000000.0
+  num_moe_experts: 64
+  moe_router_topk: 8
+  moe_router_load_balancing_type: aux_loss
+  moe_aux_loss_coeff: 0.01
+  moe_grouped_gemm: true
+  moe_token_dispatcher_type: alltoall
+  hyper_conn_block_layers: 3
+  attnres_pp_stage_aligned: true
+  attnres_pp_send_history: true
+  hyper_conn_n: 2
+  dual_residual_mix: scalar_mhc_2x2
+  dual_kv_mode: cross
+
+parallel:
+  tensor_model_parallel_size: 2
+  pipeline_model_parallel_size: 1
+  expert_model_parallel_size: 4
+  context_parallel_size: 1
+  sequence_parallel: true
+
+train:
+  output_dir: outputs/7b_moe_dual
+  train_tokens_file: data/processed/train.bin
+  val_tokens_file: data/processed/val.bin
+  micro_batch_size: 4
+  global_batch_size: 128
+  train_iters: 100000
+  lr: 0.0003
+  min_lr: 0.00003
+  weight_decay: 0.1
+  recompute_granularity: selective
+  overlap_grad_reduce: true
+  overlap_param_gather: true
+  shuffle_buffer_size: 10000
+  save_interval: 1000
+  eval_interval: 1000
+  eval_iters: 20
+  log_interval: 1

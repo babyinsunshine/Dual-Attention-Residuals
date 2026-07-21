@@ -1,0 +1,14 @@
+.venv/
+.cache/
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+data/processed/
+outputs/
+checkpoints/
+logs/
+wandb/
+core
+core.*

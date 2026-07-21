@@ -1,0 +1,12 @@
+torch==2.10.0
+megatron-core==0.16.1
+transformer-engine[pytorch]==2.10.0
+triton==3.6.0
+numpy==1.26.4
+PyYAML==6.0.3
+sentencepiece==0.2.1
+datasets==5.0.0
+tqdm==4.68.4
+packaging==26.2
+ninja==1.13.0
+psutil==7.2.2
