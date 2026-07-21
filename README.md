@@ -44,11 +44,11 @@ command streams a public corpus and creates training and validation binaries:
 
 ```bash
 python data/preprocess.py \
-  --dataset HuggingFaceFW/fineweb \
+  --dataset HuggingFaceFW/fineweb-edu \
   --subset sample-10BT \
   --split train \
   --tokenizer tokenizer/tokenizer.model \
-  --output-dir data/processed \
+  --output-dir data/fineweb_edu_pretok \
   --validation-tokens 10000000 \
   --add-eos
 ```
@@ -65,8 +65,8 @@ For multi-node runs, use the corresponding `*_multi_node.sh` launcher. Dataset,
 output, and schedule settings can be overridden without editing the scripts:
 
 ```bash
-TRAIN_TOKENS_FILE=data/processed/train.bin \
-VAL_TOKENS_FILE=data/processed/val.bin \
+TRAIN_TOKENS_FILE=data/fineweb_edu_pretok/train.bin \
+VAL_TOKENS_FILE=data/fineweb_edu_pretok/val.bin \
 OUTPUT_DIR=outputs/dual_smoke \
 TRAIN_ITERS=1000 \
 bash scripts/train_dual_single_node.sh

@@ -18,13 +18,13 @@ from data.tokenizer import SentencePieceTokenizer
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tokenize text into pretraining binaries.")
-    parser.add_argument("--dataset", default="HuggingFaceFW/fineweb")
+    parser.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
     parser.add_argument("--subset", default="sample-10BT")
     parser.add_argument("--split", default="train")
     parser.add_argument("--data-files", nargs="+", default=None)
     parser.add_argument("--text-column", default="text")
     parser.add_argument("--tokenizer", default="tokenizer/tokenizer.model")
-    parser.add_argument("--output-dir", default="data/processed")
+    parser.add_argument("--output-dir", default="data/fineweb_edu_pretok")
     parser.add_argument("--validation-tokens", type=int, default=10_000_000)
     parser.add_argument("--max-documents", type=int, default=None)
     parser.add_argument("--add-bos", action="store_true")
