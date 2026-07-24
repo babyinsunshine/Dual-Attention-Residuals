@@ -6,9 +6,12 @@ import hashlib
 import json
 import os
 import tempfile
+import time
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import asdict, dataclass
+from multiprocessing import get_context
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import numpy as np
 import pyarrow as pa
@@ -263,6 +266,102 @@ def make_worker_tasks(run: RunIdentity, state_dir: Path, batch_size: int) -> lis
         )
         for source in run.inputs
     ]
+
+
+def summarize_progress(
+    done: Sequence[ShardResult], total: int, started_at: float, now: float | None = None
+) -> str:
+    current = time.monotonic() if now is None else now
+    elapsed = max(current - started_at, 1e-9)
+    documents = sum(item.documents for item in done)
+    tokens = sum(item.tokens for item in done)
+    return (
+        f"files={len(done)}/{total} documents={documents:,} tokens={tokens:,} "
+        f"elapsed={elapsed:.1f}s tokens/s={tokens / elapsed:,.1f}"
+    )
+
+
+def _run_pending_tasks(
+    tasks: Sequence[WorkerTask],
+    tokenizer_path: str,
+    num_workers: int,
+    already_done: Sequence[ShardResult],
+    total: int,
+    started_at: float,
+    heartbeat_seconds: float,
+    emit: Callable[[str], None],
+) -> list[ShardResult]:
+    completed_results = list(already_done)
+    results: list[ShardResult] = []
+    with ProcessPoolExecutor(
+        max_workers=num_workers,
+        mp_context=get_context("spawn"),
+        initializer=initialize_worker,
+        initargs=(tokenizer_path,),
+    ) as executor:
+        futures = {executor.submit(tokenize_file, task): task for task in tasks}
+        pending = set(futures)
+        while pending:
+            completed, pending = wait(
+                pending, timeout=heartbeat_seconds, return_when=FIRST_COMPLETED
+            )
+            if not completed:
+                emit(summarize_progress(completed_results, total, started_at))
+                continue
+            for future in completed:
+                task = futures[future]
+                try:
+                    result = future.result()
+                except BaseException as error:
+                    for remaining in pending:
+                        remaining.cancel()
+                    raise RuntimeError(f"failed to preprocess {task.source.path}") from error
+                results.append(result)
+                completed_results.append(result)
+            emit(summarize_progress(completed_results, total, started_at))
+    return results
+
+
+def process_shards(
+    tasks: Sequence[WorkerTask],
+    tokenizer_path: str,
+    num_workers: int,
+    resume: bool,
+    heartbeat_seconds: float = 30.0,
+    emit: Callable[[str], None] = print,
+) -> list[ShardResult]:
+    started_at = time.monotonic()
+    reused: list[ShardResult] = []
+    pending: list[WorkerTask] = []
+    for task in tasks:
+        existing = load_valid_shard(task) if resume else None
+        if existing is None:
+            pending.append(task)
+        else:
+            reused.append(existing)
+    emit(f"files={len(tasks)} reused={len(reused)} pending={len(pending)}")
+    built = (
+        _run_pending_tasks(
+            pending,
+            tokenizer_path,
+            num_workers,
+            reused,
+            len(tasks),
+            started_at,
+            heartbeat_seconds,
+            emit,
+        )
+        if pending
+        else []
+    )
+    results = sorted([*reused, *built], key=lambda item: item.source.index)
+    expected_indexes = [task.source.index for task in tasks]
+    actual_indexes = [item.source.index for item in results]
+    if actual_indexes != expected_indexes:
+        raise RuntimeError(
+            f"shard results do not match input tasks: expected {expected_indexes}, got {actual_indexes}"
+        )
+    return results
 
 
 def discover_inputs(pattern: str, max_files: int | None) -> list[Path]:

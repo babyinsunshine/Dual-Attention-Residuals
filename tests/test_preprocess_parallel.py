@@ -214,3 +214,100 @@ class WorkerTests(unittest.TestCase):
             pp._WORKER_TOKENIZER = UnderflowTokenizer()
             with self.assertRaisesRegex(OverflowError, "int32"):
                 pp.tokenize_file(task)
+
+
+class ProgressTests(unittest.TestCase):
+    @staticmethod
+    def make_tasks(*indexes: int) -> list[pp.WorkerTask]:
+        return [
+            pp.WorkerTask(
+                pp.FileIdentity(index, f"/{index}.parquet", 10, 20),
+                f"/{index}.bin",
+                f"/{index}.json",
+                "hash",
+                "text",
+                2,
+                False,
+                True,
+            )
+            for index in indexes
+        ]
+
+    @staticmethod
+    def make_result(task: pp.WorkerTask, tokens: int = 8) -> pp.ShardResult:
+        return pp.ShardResult(task.source, task.shard_path, task.sidecar_path, 2, 0, tokens)
+
+    def test_process_shards_preserves_source_order_and_reports_resume(self) -> None:
+        tasks = self.make_tasks(0, 1)
+        reused = self.make_result(tasks[0])
+        built = self.make_result(tasks[1], 12)
+        messages: list[str] = []
+        with mock.patch.object(pp, "load_valid_shard", side_effect=[reused, None]), mock.patch.object(
+            pp, "_run_pending_tasks", return_value=[built]
+        ):
+            results = pp.process_shards(tasks, "tokenizer.model", 4, True, emit=messages.append)
+        self.assertEqual([item.source.index for item in results], [0, 1])
+        self.assertTrue(any("reused=1" in line for line in messages))
+
+    def test_process_shards_with_all_reused_results_skips_executor(self) -> None:
+        tasks = self.make_tasks(0, 1)
+        reused = [self.make_result(task) for task in tasks]
+        with mock.patch.object(pp, "load_valid_shard", side_effect=reused), mock.patch.object(
+            pp, "_run_pending_tasks", side_effect=AssertionError("executor should not run")
+        ):
+            results = pp.process_shards(tasks, "tokenizer.model", 4, True)
+        self.assertEqual(results, reused)
+
+    def test_process_shards_accepts_resume_tail_indexes(self) -> None:
+        tasks = self.make_tasks(4, 5)
+        built = [self.make_result(tasks[1]), self.make_result(tasks[0])]
+        with mock.patch.object(pp, "load_valid_shard", return_value=None), mock.patch.object(
+            pp, "_run_pending_tasks", return_value=built
+        ):
+            results = pp.process_shards(tasks, "tokenizer.model", 4, True)
+        self.assertEqual([item.source.index for item in results], [4, 5])
+
+    def test_summarize_progress_contains_counts_and_rate(self) -> None:
+        result = pp.ShardResult(pp.FileIdentity(0, "/a", 1, 1), "/a.bin", "/a.json", 4, 1, 100)
+        message = pp.summarize_progress([result], total=2, started_at=10.0, now=20.0)
+        self.assertIn("files=1/2", message)
+        self.assertIn("documents=4", message)
+        self.assertIn("tokens=100", message)
+        self.assertIn("tokens/s=10.0", message)
+
+    def test_run_pending_tasks_emits_heartbeats_on_timeout_and_completion(self) -> None:
+        task = self.make_tasks(0)[0]
+        result = self.make_result(task)
+        future = mock.Mock()
+        future.result.return_value = result
+        executor = mock.MagicMock()
+        executor.__enter__.return_value = executor
+        executor.submit.return_value = future
+        messages: list[str] = []
+        with mock.patch.object(pp, "ProcessPoolExecutor", return_value=executor), mock.patch.object(
+            pp, "wait", side_effect=[(set(), {future}), ({future}, set())]
+        ), mock.patch.object(pp, "get_context", return_value="spawn-context"):
+            results = pp._run_pending_tasks(
+                [task], "tokenizer.model", 2, [], 1, 10.0, 0.1, messages.append
+            )
+        self.assertEqual(results, [result])
+        self.assertEqual(len(messages), 2)
+        self.assertTrue(all("files=" in message for message in messages))
+        executor.submit.assert_called_once_with(pp.tokenize_file, task)
+        executor.__enter__.assert_called_once_with()
+
+    def test_run_pending_tasks_reports_worker_path_and_cancels_remaining_work(self) -> None:
+        tasks = self.make_tasks(4, 5)
+        failed = mock.Mock()
+        failed.result.side_effect = ValueError("bad parquet")
+        remaining = mock.Mock()
+        executor = mock.MagicMock()
+        executor.__enter__.return_value = executor
+        executor.submit.side_effect = [failed, remaining]
+        with mock.patch.object(pp, "ProcessPoolExecutor", return_value=executor), mock.patch.object(
+            pp, "wait", return_value=({failed}, {remaining})
+        ), mock.patch.object(pp, "get_context", return_value="spawn-context"):
+            with self.assertRaisesRegex(RuntimeError, "failed to preprocess /4.parquet") as raised:
+                pp._run_pending_tasks(tasks, "tokenizer.model", 2, [], 2, 10.0, 0.1, lambda _: None)
+        self.assertIsInstance(raised.exception.__cause__, ValueError)
+        remaining.cancel.assert_called_once_with()
