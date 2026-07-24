@@ -366,3 +366,182 @@ class ProgressTests(unittest.TestCase):
                 pp._run_pending_tasks(tasks, "tokenizer.model", 2, [], 2, 10.0, 0.1, lambda _: None)
         self.assertIsInstance(raised.exception.__cause__, ValueError)
         remaining.cancel.assert_called_once_with()
+
+
+class MergeTests(unittest.TestCase):
+    def write_result(self, root: Path, index: int, values: list[int]) -> pp.ShardResult:
+        shard = root / ".preprocess" / "shards" / f"{index:06d}.bin"
+        sidecar = shard.with_suffix(".json")
+        shard.parent.mkdir(parents=True, exist_ok=True)
+        np.asarray(values, dtype="<i4").tofile(shard)
+        sidecar.write_text("{}", encoding="utf-8")
+        return pp.ShardResult(
+            pp.FileIdentity(index, f"/source/{index}.parquet", 1, 1),
+            str(shard), str(sidecar), 1, 0, len(values),
+        )
+
+    @staticmethod
+    def state_payload(manifest: pp.RunManifest, **overrides: object) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "manifest_sha256": manifest.sha256,
+            "next_index": 0,
+            "validation_bytes": 0,
+            "training_bytes": 0,
+            "documents": 0,
+            "skipped_documents": 0,
+            "tokens": 0,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_merge_splits_exact_validation_and_deletes_committed_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = [
+                self.write_result(root, 0, [1, 2, 3]),
+                self.write_result(root, 1, [4, 5, 6]),
+            ]
+            manifest = pp.write_run_manifest(root / ".preprocess", "run-hash", results)
+            state = pp.merge_shards(results, root, 4, manifest, resume=False)
+            self.assertEqual(np.fromfile(root / "val.bin.partial", dtype="<i4").tolist(), [1, 2, 3, 4])
+            self.assertEqual(np.fromfile(root / "train.bin.partial", dtype="<i4").tolist(), [5, 6])
+            self.assertEqual(state.next_index, 2)
+            self.assertFalse(Path(results[0].shard_path).exists())
+            self.assertFalse(Path(results[0].sidecar_path).exists())
+
+    def test_merge_resume_truncates_uncommitted_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self.write_result(root, 0, [7])
+            second = self.write_result(root, 1, [8, 9])
+            manifest = pp.write_run_manifest(root / ".preprocess", "run-hash", [first, second])
+            np.asarray([7, 99], dtype="<i4").tofile(root / "val.bin.partial")
+            pp.atomic_write_json(
+                root / ".preprocess" / "merge-state.json",
+                self.state_payload(
+                    manifest, next_index=1, validation_bytes=4, documents=1, tokens=1
+                ),
+            )
+            pp.merge_shards([first, second], root, 3, manifest, resume=True)
+            self.assertEqual(np.fromfile(root / "val.bin.partial", dtype="<i4").tolist(), [7, 8, 9])
+
+    def test_resume_context_does_not_require_deleted_committed_shard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = [self.write_result(root, 0, [1]), self.write_result(root, 1, [2])]
+            manifest = pp.write_run_manifest(root / ".preprocess", "run-hash", results)
+            pp.atomic_write_json(
+                root / ".preprocess" / "merge-state.json",
+                self.state_payload(
+                    manifest, next_index=1, validation_bytes=4, documents=1, tokens=1
+                ),
+            )
+            Path(results[0].shard_path).unlink()
+            Path(results[0].sidecar_path).unlink()
+            loaded_manifest, loaded_state = pp.load_resume_context(root / ".preprocess", "run-hash")
+            self.assertEqual(loaded_manifest.results, tuple(results))
+            self.assertEqual(loaded_state.next_index, 1)
+
+    def test_load_resume_context_requires_both_files_and_matching_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / ".preprocess"
+            self.assertIsNone(pp.load_resume_context(state_dir, "run-hash"))
+            pp.atomic_write_json(state_dir / "merge-state.json", {})
+            with self.assertRaisesRegex(RuntimeError, "both"):
+                pp.load_resume_context(state_dir, "run-hash")
+            (state_dir / "merge-state.json").unlink()
+            manifest = pp.write_run_manifest(state_dir, "run-hash", [])
+            with self.assertRaisesRegex(RuntimeError, "both"):
+                pp.load_resume_context(state_dir, "run-hash")
+            pp.atomic_write_json(state_dir / "merge-state.json", self.state_payload(manifest))
+            with self.assertRaisesRegex(RuntimeError, "run hash"):
+                pp.load_resume_context(state_dir, "other-run")
+
+    def test_load_resume_context_rejects_invalid_state_types_counters_and_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.write_result(root, 0, [1])
+            manifest = pp.write_run_manifest(root / ".preprocess", "run-hash", [result])
+            invalid_payloads = (
+                self.state_payload(manifest, manifest_sha256="different-manifest"),
+                self.state_payload(manifest, next_index=True),
+                self.state_payload(manifest, next_index=2),
+                self.state_payload(manifest, validation_bytes=2),
+                self.state_payload(manifest, validation_bytes=4, tokens=0),
+                self.state_payload(manifest, next_index=1, validation_bytes=4, documents=0, tokens=1),
+            )
+            for payload in invalid_payloads:
+                with self.subTest(payload=payload):
+                    pp.atomic_write_json(root / ".preprocess" / "merge-state.json", payload)
+                    with self.assertRaises(RuntimeError):
+                        pp.load_resume_context(root / ".preprocess", "run-hash")
+
+    def test_write_run_manifest_refuses_a_different_immutable_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / ".preprocess"
+            first = self.write_result(Path(tmp), 0, [1])
+            pp.write_run_manifest(state_dir, "run-hash", [first])
+            changed = pp.ShardResult(
+                first.source, first.shard_path, first.sidecar_path, 1, 0, 2
+            )
+            with self.assertRaisesRegex(RuntimeError, "differs"):
+                pp.write_run_manifest(state_dir, "run-hash", [changed])
+
+    def test_recover_output_file_handles_missing_short_and_long_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "output.bin"
+            pp.recover_output_file(path, 0)
+            self.assertTrue(path.exists())
+            with self.assertRaisesRegex(RuntimeError, "missing committed"):
+                pp.recover_output_file(Path(tmp) / "missing.bin", 4)
+            path.write_bytes(b"\x00\x00")
+            with self.assertRaisesRegex(RuntimeError, "shorter"):
+                pp.recover_output_file(path, 4)
+            np.asarray([1, 2], dtype="<i4").tofile(path)
+            pp.recover_output_file(path, 4)
+            self.assertEqual(path.stat().st_size, 4)
+
+    def test_merge_rejects_wrong_shard_byte_size_before_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.write_result(root, 0, [1, 2])
+            with Path(result.shard_path).open("r+b") as stream:
+                stream.truncate(4)
+            manifest = pp.write_run_manifest(root / ".preprocess", "run-hash", [result])
+            with self.assertRaisesRegex(RuntimeError, "unexpected byte size"):
+                pp.merge_shards([result], root, 2, manifest, resume=False)
+            self.assertTrue(Path(result.shard_path).exists())
+            self.assertTrue(Path(result.sidecar_path).exists())
+
+    def test_merge_keeps_shard_when_journal_write_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.write_result(root, 0, [1])
+            manifest = pp.write_run_manifest(root / ".preprocess", "run-hash", [result])
+            with mock.patch.object(pp, "atomic_write_json", side_effect=OSError("journal failed")):
+                with self.assertRaisesRegex(OSError, "journal failed"):
+                    pp.merge_shards([result], root, 1, manifest, resume=False)
+            self.assertTrue(Path(result.shard_path).exists())
+            self.assertTrue(Path(result.sidecar_path).exists())
+            self.assertFalse((root / ".preprocess" / "merge-state.json").exists())
+            self.assertEqual(np.fromfile(root / "val.bin.partial", dtype="<i4").tolist(), [1])
+
+    def test_merge_fills_validation_before_training_when_shard_crosses_quota(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.write_result(root, 0, [10, 11, 12, 13])
+            manifest = pp.write_run_manifest(root / ".preprocess", "run-hash", [result])
+            pp.merge_shards([result], root, 2, manifest, resume=False)
+            self.assertEqual(np.fromfile(root / "val.bin.partial", dtype="<i4").tolist(), [10, 11])
+            self.assertEqual(np.fromfile(root / "train.bin.partial", dtype="<i4").tolist(), [12, 13])
+
+    def test_merge_commits_an_empty_shard_without_mapping_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.write_result(root, 0, [])
+            manifest = pp.write_run_manifest(root / ".preprocess", "run-hash", [result])
+            state = pp.merge_shards([result], root, 1, manifest, resume=False)
+            self.assertEqual(state.next_index, 1)
+            self.assertEqual(state.tokens, 0)
+            self.assertFalse(Path(result.shard_path).exists())

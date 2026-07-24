@@ -23,6 +23,8 @@ from data.tokenizer import SentencePieceTokenizer, TokenizerLike
 FORMAT_VERSION = 1
 TOKEN_DTYPE = "<i4"
 EXPECTED_VOCAB_SIZE = 131_072
+TOKEN_BYTES = np.dtype(TOKEN_DTYPE).itemsize
+COPY_TOKENS = 16_777_216
 
 _WORKER_TOKENIZER: TokenizerLike | None = None
 
@@ -150,6 +152,23 @@ class ShardResult:
             skipped_documents=int(payload["skipped_documents"]),
             tokens=int(payload["tokens"]),
         )
+
+
+@dataclass(frozen=True)
+class RunManifest:
+    sha256: str
+    results: tuple[ShardResult, ...]
+
+
+@dataclass(frozen=True)
+class MergeState:
+    manifest_sha256: str
+    next_index: int
+    validation_bytes: int
+    training_bytes: int
+    documents: int
+    skipped_documents: int
+    tokens: int
 
 
 def initialize_worker(tokenizer_path: str) -> None:
@@ -385,6 +404,296 @@ def process_shards(
             f"shard results do not match input tasks: expected {expected_indexes}, got {actual_indexes}"
         )
     return results
+
+
+def _require_nonnegative_int(value: object, field: str) -> int:
+    if type(value) is not int or value < 0:
+        raise RuntimeError(f"invalid {field} in preprocessing state")
+    return value
+
+
+def _strict_file_identity(payload: object) -> FileIdentity:
+    if not isinstance(payload, dict) or set(payload) != {"index", "path", "size", "mtime_ns"}:
+        raise RuntimeError("invalid source identity in preprocessing state")
+    index = _require_nonnegative_int(payload["index"], "source index")
+    size = _require_nonnegative_int(payload["size"], "source size")
+    mtime_ns = _require_nonnegative_int(payload["mtime_ns"], "source mtime_ns")
+    if type(payload["path"]) is not str:
+        raise RuntimeError("invalid source path in preprocessing state")
+    return FileIdentity(index, payload["path"], size, mtime_ns)
+
+
+def _strict_shard_result(payload: object) -> ShardResult:
+    fields = {"source", "shard_path", "sidecar_path", "documents", "skipped_documents", "tokens"}
+    if not isinstance(payload, dict) or set(payload) != fields:
+        raise RuntimeError("invalid shard result in preprocessing state")
+    if type(payload["shard_path"]) is not str or type(payload["sidecar_path"]) is not str:
+        raise RuntimeError("invalid shard paths in preprocessing state")
+    return ShardResult(
+        _strict_file_identity(payload["source"]),
+        payload["shard_path"],
+        payload["sidecar_path"],
+        _require_nonnegative_int(payload["documents"], "documents"),
+        _require_nonnegative_int(payload["skipped_documents"], "skipped_documents"),
+        _require_nonnegative_int(payload["tokens"], "tokens"),
+    )
+
+
+def _validate_results(results: Sequence[ShardResult]) -> tuple[ShardResult, ...]:
+    normalized = tuple(results)
+    if any(type(result) is not ShardResult for result in normalized):
+        raise RuntimeError("run manifest contains an invalid shard result")
+    indexes = [result.source.index for result in normalized]
+    if indexes != sorted(indexes) or len(indexes) != len(set(indexes)):
+        raise RuntimeError("run manifest shard indexes must be ordered and unique")
+    for result in normalized:
+        if (
+            type(result.source) is not FileIdentity
+            or type(result.source.index) is not int
+            or type(result.source.path) is not str
+            or type(result.source.size) is not int
+            or type(result.source.mtime_ns) is not int
+            or type(result.shard_path) is not str
+            or type(result.sidecar_path) is not str
+            or type(result.documents) is not int
+            or type(result.skipped_documents) is not int
+            or type(result.tokens) is not int
+            or result.source.path == ""
+            or result.source.index < 0
+            or result.source.size < 0
+            or result.source.mtime_ns < 0
+            or result.documents < 0
+            or result.skipped_documents < 0
+            or result.tokens < 0
+        ):
+            raise RuntimeError("run manifest contains negative shard counters")
+    return normalized
+
+
+def _manifest_payload(run_sha256: str, results: Sequence[ShardResult]) -> dict[str, object]:
+    if type(run_sha256) is not str or not run_sha256:
+        raise RuntimeError("run hash must be a non-empty string")
+    normalized = _validate_results(results)
+    return {"run_sha256": run_sha256, "results": [result.to_json() for result in normalized]}
+
+
+def _atomic_write_canonical_json(path: Path, payload: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb", dir=path.parent, prefix=f".{path.name}.", suffix=".partial", delete=False
+        ) as stream:
+            partial = Path(stream.name)
+            stream.write(canonical_json(payload).encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(partial, path)
+    except BaseException:
+        if partial is not None:
+            partial.unlink(missing_ok=True)
+        raise
+
+
+def _manifest_from_payload(payload: object, run_sha256: str) -> RunManifest:
+    if not isinstance(payload, dict) or set(payload) != {"run_sha256", "results"}:
+        raise RuntimeError("invalid run manifest structure")
+    if type(payload["run_sha256"]) is not str or payload["run_sha256"] != run_sha256:
+        raise RuntimeError("run hash does not match run manifest")
+    if not isinstance(payload["results"], list):
+        raise RuntimeError("invalid run manifest results")
+    results = tuple(_strict_shard_result(item) for item in payload["results"])
+    _validate_results(results)
+    canonical = canonical_json({"run_sha256": run_sha256, "results": [item.to_json() for item in results]})
+    return RunManifest(hashlib.sha256(canonical.encode("utf-8")).hexdigest(), results)
+
+
+def write_run_manifest(
+    state_dir: Path, run_sha256: str, results: Sequence[ShardResult]
+) -> RunManifest:
+    payload = _manifest_payload(run_sha256, results)
+    manifest = _manifest_from_payload(payload, run_sha256)
+    path = state_dir / "run-manifest.json"
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"invalid existing run manifest: {path}") from error
+        if canonical_json(existing) != canonical_json(payload):
+            raise RuntimeError(f"existing run manifest differs: {path}")
+    else:
+        _atomic_write_canonical_json(path, payload)
+    return manifest
+
+
+def _validate_merge_state(payload: object, manifest: RunManifest) -> MergeState:
+    fields = {
+        "manifest_sha256", "next_index", "validation_bytes", "training_bytes",
+        "documents", "skipped_documents", "tokens",
+    }
+    if not isinstance(payload, dict) or set(payload) != fields:
+        raise RuntimeError("invalid merge state structure")
+    if type(payload["manifest_sha256"]) is not str or payload["manifest_sha256"] != manifest.sha256:
+        raise RuntimeError("merge state manifest hash does not match")
+    state = MergeState(
+        payload["manifest_sha256"],
+        _require_nonnegative_int(payload["next_index"], "next_index"),
+        _require_nonnegative_int(payload["validation_bytes"], "validation_bytes"),
+        _require_nonnegative_int(payload["training_bytes"], "training_bytes"),
+        _require_nonnegative_int(payload["documents"], "documents"),
+        _require_nonnegative_int(payload["skipped_documents"], "skipped_documents"),
+        _require_nonnegative_int(payload["tokens"], "tokens"),
+    )
+    if state.next_index > len(manifest.results):
+        raise RuntimeError("merge state next_index is outside manifest bounds")
+    if state.validation_bytes % TOKEN_BYTES or state.training_bytes % TOKEN_BYTES:
+        raise RuntimeError("merge state byte counts are not int32 aligned")
+    committed = manifest.results[:state.next_index]
+    expected_documents = sum(item.documents for item in committed)
+    expected_skipped = sum(item.skipped_documents for item in committed)
+    expected_tokens = sum(item.tokens for item in committed)
+    if (
+        (state.documents, state.skipped_documents, state.tokens)
+        != (expected_documents, expected_skipped, expected_tokens)
+        or state.validation_bytes + state.training_bytes != expected_tokens * TOKEN_BYTES
+    ):
+        raise RuntimeError("merge state counters do not match committed shards")
+    return state
+
+
+def _load_merge_state(state_path: Path, manifest: RunManifest) -> MergeState:
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid merge state: {state_path}") from error
+    return _validate_merge_state(payload, manifest)
+
+
+def load_resume_context(state_dir: Path, run_sha256: str) -> tuple[RunManifest, MergeState] | None:
+    manifest_path = state_dir / "run-manifest.json"
+    state_path = state_dir / "merge-state.json"
+    manifest_exists, state_exists = manifest_path.exists(), state_path.exists()
+    if not manifest_exists and not state_exists:
+        return None
+    if manifest_exists != state_exists:
+        raise RuntimeError("resume requires both run-manifest.json and merge-state.json")
+    try:
+        manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid run manifest: {manifest_path}") from error
+    manifest = _manifest_from_payload(manifest_payload, run_sha256)
+    return manifest, _load_merge_state(state_path, manifest)
+
+
+def recover_output_file(path: Path, committed_bytes: int) -> None:
+    if type(committed_bytes) is not int or committed_bytes < 0 or committed_bytes % TOKEN_BYTES:
+        raise RuntimeError(f"invalid committed byte count for merge output: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        if committed_bytes:
+            raise RuntimeError(f"missing committed merge output: {path}")
+        path.touch()
+    actual = path.stat().st_size
+    if actual < committed_bytes:
+        raise RuntimeError(
+            f"merge output is shorter than journal: {path} ({actual} < {committed_bytes})"
+        )
+    if actual > committed_bytes:
+        with path.open("r+b") as stream:
+            stream.truncate(committed_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+
+def write_token_range(source: object, start: int, stop: int, destination: object) -> int:
+    written = 0
+    for offset in range(start, stop, COPY_TOKENS):
+        end = min(stop, offset + COPY_TOKENS)
+        chunk = np.asarray(source[offset:end], dtype=TOKEN_DTYPE)
+        payload = chunk.tobytes(order="C")
+        destination.write(payload)
+        written += len(payload)
+    return written
+
+
+def _state_dir_for_results(results: Sequence[ShardResult], output_dir: Path) -> Path:
+    if not results:
+        return output_dir / ".preprocess"
+    state_dir = Path(results[0].shard_path).parent.parent
+    if any(Path(result.shard_path).parent.parent != state_dir for result in results):
+        raise RuntimeError("all merge shards must share one state directory")
+    return state_dir
+
+
+def _initial_merge_state(manifest: RunManifest) -> MergeState:
+    return MergeState(manifest.sha256, 0, 0, 0, 0, 0, 0)
+
+
+def merge_shards(
+    results: Sequence[ShardResult], output_dir: Path, validation_tokens: int,
+    run_manifest: RunManifest, resume: bool,
+) -> MergeState:
+    if type(validation_tokens) is not int or validation_tokens < 1:
+        raise ValueError("validation_tokens must be positive")
+    normalized = _validate_results(results)
+    if type(run_manifest) is not RunManifest or normalized != run_manifest.results:
+        raise RuntimeError("merge results do not match run manifest")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    state_dir = _state_dir_for_results(normalized, output_dir)
+    state_path = state_dir / "merge-state.json"
+    state = _load_merge_state(state_path, run_manifest) if resume and state_path.exists() else _initial_merge_state(run_manifest)
+    committed_tokens = sum(item.tokens for item in normalized[:state.next_index])
+    expected_validation_bytes = min(committed_tokens, validation_tokens) * TOKEN_BYTES
+    if state.validation_bytes != expected_validation_bytes:
+        raise RuntimeError("merge state validation bytes do not match the requested split")
+    validation_path = output_dir / "val.bin.partial"
+    training_path = output_dir / "train.bin.partial"
+    recover_output_file(validation_path, state.validation_bytes)
+    recover_output_file(training_path, state.training_bytes)
+    for committed in normalized[:state.next_index]:
+        Path(committed.shard_path).unlink(missing_ok=True)
+        Path(committed.sidecar_path).unlink(missing_ok=True)
+    with validation_path.open("ab") as validation_output, training_path.open("ab") as training_output:
+        for position, result in enumerate(normalized[state.next_index:], start=state.next_index):
+            shard = Path(result.shard_path)
+            expected_bytes = result.tokens * TOKEN_BYTES
+            try:
+                actual_bytes = shard.stat().st_size
+            except OSError as error:
+                raise RuntimeError(f"missing uncommitted merge shard: {shard}") from error
+            if actual_bytes != expected_bytes:
+                raise RuntimeError(
+                    f"merge shard has unexpected byte size: {shard} ({actual_bytes} != {expected_bytes})"
+                )
+            source = (
+                np.memmap(shard, dtype=TOKEN_DTYPE, mode="r", shape=(result.tokens,))
+                if result.tokens
+                else np.empty(0, dtype=TOKEN_DTYPE)
+            )
+            try:
+                validation_remaining = max(0, validation_tokens - state.validation_bytes // TOKEN_BYTES)
+                validation_count = min(validation_remaining, result.tokens)
+                validation_written = write_token_range(source, 0, validation_count, validation_output)
+                training_written = write_token_range(source, validation_count, result.tokens, training_output)
+            finally:
+                del source
+            validation_output.flush()
+            os.fsync(validation_output.fileno())
+            training_output.flush()
+            os.fsync(training_output.fileno())
+            state = MergeState(
+                run_manifest.sha256,
+                position + 1,
+                state.validation_bytes + validation_written,
+                state.training_bytes + training_written,
+                state.documents + result.documents,
+                state.skipped_documents + result.skipped_documents,
+                state.tokens + result.tokens,
+            )
+            atomic_write_json(state_path, asdict(state))
+            shard.unlink()
+            Path(result.sidecar_path).unlink()
+    return state
 
 
 def discover_inputs(pattern: str, max_files: int | None) -> list[Path]:
