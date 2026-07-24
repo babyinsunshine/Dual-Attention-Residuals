@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import glob
 import hashlib
@@ -876,12 +877,36 @@ def _source_manifest_sha256(run: RunIdentity) -> str:
 
 
 FileIdentityTuple = tuple[int, int, int]
+RENAME_NOREPLACE = 1
+AT_FDCWD = -100
+
+
+def _rename_no_replace(source: Path, destination: Path) -> None:
+    """Linux renameat2(RENAME_NOREPLACE), used only for same-directory outputs."""
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("atomic no-replace publication requires Linux renameat2")
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as error:
+        raise RuntimeError("atomic no-replace publication requires libc renameat2") from error
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        AT_FDCWD, os.fsencode(source), AT_FDCWD, os.fsencode(destination), RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    failure = ctypes.get_errno()
+    if failure == errno.EEXIST:
+        raise FileExistsError(failure, os.strerror(failure), destination)
+    raise OSError(failure, os.strerror(failure), destination)
 
 
 def _open_regular_file(
-    directory_fd: int, name: str, expected_size: int | None, label: str,
+    directory_fd: int, name: str, expected_size: int | None, label: str, writable: bool = False,
 ) -> tuple[int, FileIdentityTuple]:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags = (os.O_RDWR if writable else os.O_RDONLY) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     descriptor = os.open(name, flags, dir_fd=directory_fd)
     try:
         status = os.fstat(descriptor)
@@ -913,18 +938,9 @@ def _verify_named_identity(
         os.close(descriptor)
 
 
-def _unlink_owned_name(
-    directory_fd: int, name: str, expected: FileIdentityTuple, label: str,
-) -> None:
-    try:
-        _verify_named_identity(directory_fd, name, expected, label)
-    except FileNotFoundError:
-        return
-    os.unlink(name, dir_fd=directory_fd)
-
-
 def _publish_binary_no_replace(
-    directory_fd: int, partial_name: str, final_name: str, expected_bytes: int, label: str,
+    directory_fd: int, directory: Path, partial_name: str, final_name: str,
+    expected_bytes: int, label: str,
 ) -> tuple[int, FileIdentityTuple]:
     partial_fd, partial_identity = _open_regular_file(
         directory_fd, partial_name, expected_bytes, f"partial {label}"
@@ -933,10 +949,8 @@ def _publish_binary_no_replace(
     published = False
     try:
         try:
-            os.link(
-                partial_name, final_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
-                follow_symlinks=False,
-            )
+            _rename_no_replace(directory / partial_name, directory / final_name)
+            _fsync_directory(directory)
         except FileExistsError:
             final_fd, final_identity = _open_regular_file(directory_fd, final_name, expected_bytes, label)
             if final_identity != partial_identity:
@@ -949,7 +963,6 @@ def _publish_binary_no_replace(
                 os.close(final_fd)
                 final_fd = None
                 raise RuntimeError(f"{label} publication did not preserve the validated partial inode")
-        _unlink_owned_name(directory_fd, partial_name, partial_identity, f"partial {label}")
         published = True
         return final_fd, final_identity
     finally:
@@ -960,8 +973,8 @@ def _publish_binary_no_replace(
 
 def _atomic_create_json(
     directory_fd: int, directory: Path, name: str, payload: Mapping[str, object],
-) -> FileIdentityTuple:
-    """Atomically link JSON into place and return the created inode identity."""
+) -> tuple[FileIdentityTuple, int]:
+    """Atomically rename JSON into place and return its identity and writable fd."""
     temporary: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -974,24 +987,25 @@ def _atomic_create_json(
             os.fsync(stream.fileno())
             status = os.fstat(stream.fileno())
             identity = (status.st_dev, status.st_ino, status.st_size)
-        os.link(temporary, name, dst_dir_fd=directory_fd, follow_symlinks=False)
+        _rename_no_replace(temporary, directory / name)
         _fsync_directory(directory)
-        temporary.unlink()
-        _fsync_directory(directory)
-        return identity
+        metadata_fd, metadata_identity = _open_regular_file(
+            directory_fd, name, identity[2], "completion metadata", writable=True
+        )
+        if metadata_identity != identity:
+            os.close(metadata_fd)
+            raise RuntimeError("completion metadata changed during publication")
+        return identity, metadata_fd
     except BaseException:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
         raise
 
 
-def _unlink_if_identity(directory_fd: int, directory: Path, name: str, expected: FileIdentityTuple) -> None:
-    try:
-        _verify_named_identity(directory_fd, name, expected, "completion metadata")
-    except (FileNotFoundError, RuntimeError):
-        return
-    os.unlink(name, dir_fd=directory_fd)
-    _fsync_directory(directory)
+def _invalidate_metadata_descriptor(descriptor: int) -> None:
+    os.ftruncate(descriptor, 0)
+    os.write(descriptor, b'{"incomplete":true}\n')
+    os.fsync(descriptor)
 
 
 def _final_metadata(
@@ -1033,6 +1047,12 @@ def _validate_finalization_inputs(
         raise ValueError("batch_size and num_workers must be positive")
     if type(validation_tokens) is not int or validation_tokens < 1:
         raise ValueError("validation_tokens must be positive")
+    normalized_results = _validate_results(manifest.results)
+    manifest_payload = {"run_sha256": run.digest(), "results": [item.to_json() for item in normalized_results]}
+    expected_manifest_sha256 = hashlib.sha256(canonical_json(manifest_payload).encode("utf-8")).hexdigest()
+    if type(manifest.sha256) is not str or manifest.sha256 != expected_manifest_sha256:
+        raise RuntimeError("run manifest hash does not match the current run")
+    _validate_merge_state(asdict(state), manifest)
     if state.manifest_sha256 != manifest.sha256 or state.next_index != len(manifest.results):
         raise RuntimeError("merge state does not match completed run manifest")
     if tuple(result.source for result in manifest.results) != run.inputs:
@@ -1082,7 +1102,7 @@ def finalize_outputs(
                 )
             except FileNotFoundError:
                 final_fd, final_identity = _publish_binary_no_replace(
-                    directory_fd, partial_name, final_name, expected_bytes, label
+                    directory_fd, resolved, partial_name, final_name, expected_bytes, label
                 )
             else:
                 try:
@@ -1098,9 +1118,6 @@ def finalize_outputs(
                             raise RuntimeError(
                                 f"cannot finalize {label}: partial and final files have different inodes"
                             )
-                        _unlink_owned_name(
-                            directory_fd, partial_name, partial_identity, f"partial {label}"
-                        )
                 except BaseException:
                     os.close(final_fd)
                     raise
@@ -1108,13 +1125,15 @@ def finalize_outputs(
         for _, identity, name, label in held_finals:
             _verify_named_identity(directory_fd, name, identity, label)
         metadata = _final_metadata(run, manifest, merge_state, batch_size, num_workers)
-        metadata_identity = _atomic_create_json(directory_fd, resolved, "metadata.json", metadata)
+        metadata_identity, metadata_fd = _atomic_create_json(directory_fd, resolved, "metadata.json", metadata)
         try:
             for _, identity, name, label in held_finals:
                 _verify_named_identity(directory_fd, name, identity, label)
         except BaseException:
-            _unlink_if_identity(directory_fd, resolved, "metadata.json", metadata_identity)
+            _invalidate_metadata_descriptor(metadata_fd)
             raise
+        finally:
+            os.close(metadata_fd)
         return metadata
     finally:
         for descriptor, _, _, _ in held_finals:
