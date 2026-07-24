@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import tempfile
 import threading
@@ -544,4 +545,149 @@ class MergeTests(unittest.TestCase):
             state = pp.merge_shards([result], root, 1, manifest, resume=False)
             self.assertEqual(state.next_index, 1)
             self.assertEqual(state.tokens, 0)
+            self.assertFalse(Path(result.shard_path).exists())
+
+    def test_merge_resume_requires_an_existing_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.write_result(root, 0, [1])
+            manifest = pp.write_run_manifest(root / ".preprocess", "run-hash", [result])
+            with self.assertRaisesRegex(RuntimeError, "merge-state.json"):
+                pp.merge_shards([result], root, 1, manifest, resume=True)
+            self.assertTrue(Path(result.shard_path).exists())
+            self.assertFalse((root / "val.bin.partial").exists())
+
+    def test_fresh_merge_refuses_an_existing_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.write_result(root, 0, [1])
+            manifest = pp.write_run_manifest(root / ".preprocess", "run-hash", [result])
+            pp.atomic_write_json(
+                root / ".preprocess" / "merge-state.json", self.state_payload(manifest)
+            )
+            with self.assertRaisesRegex(RuntimeError, "existing merge state"):
+                pp.merge_shards([result], root, 1, manifest, resume=False)
+            self.assertTrue(Path(result.shard_path).exists())
+            self.assertFalse((root / "val.bin.partial").exists())
+
+    def test_fresh_merge_refuses_existing_partial_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.write_result(root, 0, [1])
+            manifest = pp.write_run_manifest(root / ".preprocess", "run-hash", [result])
+            np.asarray([99], dtype="<i4").tofile(root / "val.bin.partial")
+            with self.assertRaisesRegex(RuntimeError, "existing partial outputs"):
+                pp.merge_shards([result], root, 1, manifest, resume=False)
+            self.assertTrue(Path(result.shard_path).exists())
+
+    def test_resume_context_rejects_tampered_generated_shard_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.write_result(root, 0, [1])
+            state_dir = root / ".preprocess"
+            pp.write_run_manifest(state_dir, "run-hash", [result])
+            manifest_path = state_dir / "run-manifest.json"
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            payload["results"][0]["shard_path"] = str(root / "outside.bin")
+            manifest_path.write_text(pp.canonical_json(payload), encoding="utf-8")
+            manifest_sha256 = hashlib.sha256(pp.canonical_json(payload).encode("utf-8")).hexdigest()
+            pp.atomic_write_json(
+                state_dir / "merge-state.json",
+                {
+                    "manifest_sha256": manifest_sha256,
+                    "next_index": 0,
+                    "validation_bytes": 0,
+                    "training_bytes": 0,
+                    "documents": 0,
+                    "skipped_documents": 0,
+                    "tokens": 0,
+                },
+            )
+            with self.assertRaisesRegex(RuntimeError, "generated shard paths"):
+                pp.load_resume_context(state_dir, "run-hash")
+            self.assertTrue(Path(result.shard_path).exists())
+
+    def test_write_run_manifest_rejects_tampered_generated_sidecar_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self.write_result(root, 0, [1])
+            tampered = pp.ShardResult(
+                result.source, result.shard_path, str(root / "outside.json"), 1, 0, 1
+            )
+            with self.assertRaisesRegex(RuntimeError, "generated shard paths"):
+                pp.write_run_manifest(root / ".preprocess", "run-hash", [tampered])
+
+    def test_merge_rejects_result_paths_outside_its_output_state_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_root = root / "source-output"
+            target_root = root / "target-output"
+            result = self.write_result(source_root, 0, [1])
+            manifest = pp.write_run_manifest(source_root / ".preprocess", "run-hash", [result])
+            with self.assertRaisesRegex(RuntimeError, "generated shard paths"):
+                pp.merge_shards([result], target_root, 1, manifest, resume=False)
+            self.assertTrue(Path(result.shard_path).exists())
+            self.assertFalse((target_root / "val.bin.partial").exists())
+
+    def test_atomic_publications_fsync_parent_after_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events: list[tuple[str, Path]] = []
+            original_replace = pp.os.replace
+
+            def replace(source: str | Path, target: str | Path) -> None:
+                events.append(("replace", Path(target)))
+                original_replace(source, target)
+
+            def sync(directory: Path) -> None:
+                events.append(("sync", directory))
+
+            with mock.patch.object(pp.os, "replace", replace), mock.patch.object(
+                pp, "_fsync_directory", sync
+            ):
+                pp.atomic_write_json(root / "state.json", {"value": 1})
+            self.assertEqual([kind for kind, _ in events[-2:]], ["replace", "sync"])
+
+            events.clear()
+            result = self.write_result(root, 0, [1])
+            with mock.patch.object(pp.os, "replace", replace), mock.patch.object(
+                pp, "_fsync_directory", sync
+            ):
+                pp.write_run_manifest(root / ".preprocess", "run-hash", [result])
+            self.assertEqual([kind for kind, _ in events[-2:]], ["replace", "sync"])
+
+    def test_new_partial_output_entry_is_directory_synced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "val.bin.partial"
+            events: list[str] = []
+            original_touch = Path.touch
+
+            def touch(current: Path, *args: object, **kwargs: object) -> None:
+                events.append("touch")
+                original_touch(current, *args, **kwargs)
+
+            with mock.patch.object(Path, "touch", touch), mock.patch.object(
+                pp, "_fsync_directory", side_effect=lambda _: events.append("sync")
+            ):
+                pp.recover_output_file(path, 0)
+            self.assertEqual(events, ["touch", "sync"])
+
+    def test_directory_fsync_failure_keeps_shard_and_allows_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / ".preprocess"
+            result = self.write_result(root, 0, [1])
+            manifest = pp.write_run_manifest(state_dir, "run-hash", [result])
+
+            def fail_state_directory(directory: Path) -> None:
+                if directory.resolve() == state_dir.resolve():
+                    raise OSError("directory fsync failed")
+
+            with mock.patch.object(pp, "_fsync_directory", side_effect=fail_state_directory):
+                with self.assertRaisesRegex(OSError, "directory fsync failed"):
+                    pp.merge_shards([result], root, 1, manifest, resume=False)
+            self.assertTrue(Path(result.shard_path).exists())
+            self.assertTrue((state_dir / "merge-state.json").exists())
+            pp.merge_shards([result], root, 1, manifest, resume=True)
             self.assertFalse(Path(result.shard_path).exists())

@@ -62,8 +62,34 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _ensure_directory(path: Path) -> None:
+    if path.exists():
+        if not path.is_dir():
+            raise RuntimeError(f"expected a directory: {path}")
+        return
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    if not current.is_dir():
+        raise RuntimeError(f"expected a directory: {current}")
+    path.mkdir(parents=True, exist_ok=True)
+    for created in reversed(missing):
+        _fsync_directory(created.parent)
+
+
 def atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_directory(path.parent)
     partial: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -80,6 +106,7 @@ def atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(partial, path)
+        _fsync_directory(path.parent)
     except BaseException:
         if partial is not None:
             partial.unlink(missing_ok=True)
@@ -470,6 +497,24 @@ def _validate_results(results: Sequence[ShardResult]) -> tuple[ShardResult, ...]
     return normalized
 
 
+def _generated_shard_paths(state_dir: Path, source_index: int) -> tuple[Path, Path]:
+    shard = state_dir / "shards" / f"{source_index:06d}.bin"
+    return shard, shard.with_suffix(".json")
+
+
+def _validate_generated_shard_paths(results: Sequence[ShardResult], state_dir: Path) -> None:
+    resolved_state_dir = state_dir.resolve(strict=False)
+    for result in results:
+        expected_shard, expected_sidecar = _generated_shard_paths(resolved_state_dir, result.source.index)
+        try:
+            actual_shard = Path(result.shard_path).resolve(strict=False)
+            actual_sidecar = Path(result.sidecar_path).resolve(strict=False)
+        except OSError as error:
+            raise RuntimeError("invalid generated shard paths") from error
+        if actual_shard != expected_shard or actual_sidecar != expected_sidecar:
+            raise RuntimeError("run manifest contains invalid generated shard paths")
+
+
 def _manifest_payload(run_sha256: str, results: Sequence[ShardResult]) -> dict[str, object]:
     if type(run_sha256) is not str or not run_sha256:
         raise RuntimeError("run hash must be a non-empty string")
@@ -478,7 +523,7 @@ def _manifest_payload(run_sha256: str, results: Sequence[ShardResult]) -> dict[s
 
 
 def _atomic_write_canonical_json(path: Path, payload: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_directory(path.parent)
     partial: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -489,6 +534,7 @@ def _atomic_write_canonical_json(path: Path, payload: Mapping[str, object]) -> N
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(partial, path)
+        _fsync_directory(path.parent)
     except BaseException:
         if partial is not None:
             partial.unlink(missing_ok=True)
@@ -513,6 +559,7 @@ def write_run_manifest(
 ) -> RunManifest:
     payload = _manifest_payload(run_sha256, results)
     manifest = _manifest_from_payload(payload, run_sha256)
+    _validate_generated_shard_paths(manifest.results, state_dir)
     path = state_dir / "run-manifest.json"
     if path.exists():
         try:
@@ -582,17 +629,19 @@ def load_resume_context(state_dir: Path, run_sha256: str) -> tuple[RunManifest, 
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError(f"invalid run manifest: {manifest_path}") from error
     manifest = _manifest_from_payload(manifest_payload, run_sha256)
+    _validate_generated_shard_paths(manifest.results, state_dir)
     return manifest, _load_merge_state(state_path, manifest)
 
 
 def recover_output_file(path: Path, committed_bytes: int) -> None:
     if type(committed_bytes) is not int or committed_bytes < 0 or committed_bytes % TOKEN_BYTES:
         raise RuntimeError(f"invalid committed byte count for merge output: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_directory(path.parent)
     if not path.exists():
         if committed_bytes:
             raise RuntimeError(f"missing committed merge output: {path}")
         path.touch()
+        _fsync_directory(path.parent)
     actual = path.stat().st_size
     if actual < committed_bytes:
         raise RuntimeError(
@@ -616,15 +665,6 @@ def write_token_range(source: object, start: int, stop: int, destination: object
     return written
 
 
-def _state_dir_for_results(results: Sequence[ShardResult], output_dir: Path) -> Path:
-    if not results:
-        return output_dir / ".preprocess"
-    state_dir = Path(results[0].shard_path).parent.parent
-    if any(Path(result.shard_path).parent.parent != state_dir for result in results):
-        raise RuntimeError("all merge shards must share one state directory")
-    return state_dir
-
-
 def _initial_merge_state(manifest: RunManifest) -> MergeState:
     return MergeState(manifest.sha256, 0, 0, 0, 0, 0, 0)
 
@@ -638,24 +678,35 @@ def merge_shards(
     normalized = _validate_results(results)
     if type(run_manifest) is not RunManifest or normalized != run_manifest.results:
         raise RuntimeError("merge results do not match run manifest")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    state_dir = _state_dir_for_results(normalized, output_dir)
+    state_dir = output_dir / ".preprocess"
+    _validate_generated_shard_paths(normalized, state_dir)
     state_path = state_dir / "merge-state.json"
-    state = _load_merge_state(state_path, run_manifest) if resume and state_path.exists() else _initial_merge_state(run_manifest)
+    validation_path = output_dir / "val.bin.partial"
+    training_path = output_dir / "train.bin.partial"
+    if resume:
+        if not state_path.is_file():
+            raise RuntimeError(f"resume requires an existing merge-state.json: {state_path}")
+        state = _load_merge_state(state_path, run_manifest)
+    else:
+        if state_path.exists():
+            raise RuntimeError(f"fresh merge refuses existing merge state: {state_path}")
+        if validation_path.exists() or training_path.exists():
+            raise RuntimeError("fresh merge refuses existing partial outputs")
+        state = _initial_merge_state(run_manifest)
     committed_tokens = sum(item.tokens for item in normalized[:state.next_index])
     expected_validation_bytes = min(committed_tokens, validation_tokens) * TOKEN_BYTES
     if state.validation_bytes != expected_validation_bytes:
         raise RuntimeError("merge state validation bytes do not match the requested split")
-    validation_path = output_dir / "val.bin.partial"
-    training_path = output_dir / "train.bin.partial"
+    _ensure_directory(output_dir)
     recover_output_file(validation_path, state.validation_bytes)
     recover_output_file(training_path, state.training_bytes)
     for committed in normalized[:state.next_index]:
-        Path(committed.shard_path).unlink(missing_ok=True)
-        Path(committed.sidecar_path).unlink(missing_ok=True)
+        shard, sidecar = _generated_shard_paths(state_dir, committed.source.index)
+        shard.unlink(missing_ok=True)
+        sidecar.unlink(missing_ok=True)
     with validation_path.open("ab") as validation_output, training_path.open("ab") as training_output:
         for position, result in enumerate(normalized[state.next_index:], start=state.next_index):
-            shard = Path(result.shard_path)
+            shard, sidecar = _generated_shard_paths(state_dir, result.source.index)
             expected_bytes = result.tokens * TOKEN_BYTES
             try:
                 actual_bytes = shard.stat().st_size
@@ -692,7 +743,7 @@ def merge_shards(
             )
             atomic_write_json(state_path, asdict(state))
             shard.unlink()
-            Path(result.sidecar_path).unlink()
+            sidecar.unlink()
     return state
 
 
