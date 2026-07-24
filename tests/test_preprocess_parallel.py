@@ -368,6 +368,35 @@ class ProgressTests(unittest.TestCase):
         self.assertIsInstance(raised.exception.__cause__, ValueError)
         remaining.cancel.assert_called_once_with()
 
+    def test_run_pending_tasks_cancels_and_reraises_keyboard_interrupt(self) -> None:
+        task = self.make_tasks(0)[0]
+        interrupted = mock.Mock()
+        interrupted.result.side_effect = KeyboardInterrupt("received signal 15")
+        remaining = mock.Mock()
+        executor = mock.MagicMock()
+        executor.__enter__.return_value = executor
+        executor.submit.side_effect = [interrupted, remaining]
+        with mock.patch.object(pp, "ProcessPoolExecutor", return_value=executor), mock.patch.object(
+            pp, "wait", return_value=({interrupted}, {remaining})
+        ), mock.patch.object(pp, "get_context", return_value="spawn-context"):
+            with self.assertRaisesRegex(KeyboardInterrupt, "received signal 15"):
+                pp._run_pending_tasks([task, self.make_tasks(1)[0]], "tokenizer.model", 2, [], 2, 0.0, 0.1, lambda _: None)
+        remaining.cancel.assert_called_once_with()
+
+    def test_run_pending_tasks_does_not_wrap_system_exit(self) -> None:
+        task = self.make_tasks(0)[0]
+        exited = mock.Mock()
+        exited.result.side_effect = SystemExit(3)
+        executor = mock.MagicMock()
+        executor.__enter__.return_value = executor
+        executor.submit.return_value = exited
+        with mock.patch.object(pp, "ProcessPoolExecutor", return_value=executor), mock.patch.object(
+            pp, "wait", return_value=({exited}, set())
+        ), mock.patch.object(pp, "get_context", return_value="spawn-context"):
+            with self.assertRaises(SystemExit) as raised:
+                pp._run_pending_tasks([task], "tokenizer.model", 1, [], 1, 0.0, 0.1, lambda _: None)
+        self.assertEqual(raised.exception.code, 3)
+
 
 class MergeTests(unittest.TestCase):
     def write_result(self, root: Path, index: int, values: list[int]) -> pp.ShardResult:
@@ -696,16 +725,25 @@ class MergeTests(unittest.TestCase):
 class FinalizationTests(unittest.TestCase):
     @staticmethod
     def run_identity() -> pp.RunIdentity:
-        return pp.RunIdentity(1, tuple(), "/tokenizer.model", "abc", 131072, "text", False, True)
+        source = pp.FileIdentity(0, "/source/000.parquet", 1, 1)
+        return pp.RunIdentity(1, (source,), "/tokenizer.model", "abc", 131072, "text", False, True)
 
     @staticmethod
-    def manifest() -> pp.RunManifest:
-        return pp.RunManifest("manifest", tuple())
+    def manifest(validation_tokens: int = 2, training_tokens: int = 1) -> pp.RunManifest:
+        source = FinalizationTests.run_identity().inputs[0]
+        return pp.RunManifest(
+            "manifest",
+            (pp.ShardResult(
+                source, "/output/.preprocess/shards/000000.bin",
+                "/output/.preprocess/shards/000000.json", 1, 0,
+                validation_tokens + training_tokens,
+            ),),
+        )
 
     @staticmethod
     def state(validation_tokens: int = 2, training_tokens: int = 1) -> pp.MergeState:
         return pp.MergeState(
-            "manifest", 0, validation_tokens * 4, training_tokens * 4, 1, 0,
+            "manifest", 1, validation_tokens * 4, training_tokens * 4, 1, 0,
             validation_tokens + training_tokens,
         )
 
@@ -750,6 +788,43 @@ class FinalizationTests(unittest.TestCase):
                 pp.prepare_output(root, overwrite=True, resume=False)
             self.assertIn(mock.call(root.resolve()), sync.call_args_list)
 
+    def test_overwrite_never_traverses_a_directory_swapped_for_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / ".preprocess"
+            victim = state / "victim"
+            victim.mkdir(parents=True)
+            (victim / "generated").write_text("generated", encoding="utf-8")
+            outside = root / "outside"
+            outside.mkdir()
+            sentinel = outside / "sentinel"
+            sentinel.write_text("keep", encoding="utf-8")
+            original_scandir = os.scandir
+            original_open = os.open
+            swapped = False
+
+            def swap() -> None:
+                nonlocal swapped
+                if not swapped:
+                    victim.rename(state / "victim.original")
+                    victim.symlink_to(outside, target_is_directory=True)
+                    swapped = True
+
+            def race_scandir(path: str | bytes | int | Path):
+                if not isinstance(path, int) and Path(path) == victim:
+                    swap()
+                return original_scandir(path)
+
+            def race_open(path: str | bytes | Path, flags: int, *args: object, **kwargs: object) -> int:
+                if path == "victim" and kwargs.get("dir_fd") is not None:
+                    swap()
+                return original_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(pp.os, "scandir", race_scandir), mock.patch.object(pp.os, "open", race_open):
+                with self.assertRaises(OSError):
+                    pp.prepare_output(root, overwrite=True, resume=False)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+
     def test_finalize_writes_metadata_last_and_renames_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -776,6 +851,53 @@ class FinalizationTests(unittest.TestCase):
             self.assertEqual(np.fromfile(root / "val.bin", dtype="<i4").tolist(), [1, 2])
             self.assertEqual(np.fromfile(root / "train.bin", dtype="<i4").tolist(), [3])
 
+    def test_finalize_accepts_same_inode_partial_after_link_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            val_partial = root / "val.bin.partial"
+            np.asarray([1, 2], dtype="<i4").tofile(val_partial)
+            os.link(val_partial, root / "val.bin")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
+            pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+            self.assertFalse(val_partial.exists())
+            self.assertEqual(np.fromfile(root / "val.bin", dtype="<i4").tolist(), [1, 2])
+
+    def test_finalize_rejects_raced_binary_destination_without_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin.partial")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
+            original_link = os.link
+
+            def race(source: str | Path, destination: str | Path, *args: object, **kwargs: object) -> None:
+                if Path(destination).name == "val.bin":
+                    np.asarray([99, 100], dtype="<i4").tofile(destination)
+                original_link(source, destination, *args, **kwargs)
+
+            with mock.patch.object(pp.os, "link", race):
+                with self.assertRaisesRegex(RuntimeError, "destination"):
+                    pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+            self.assertEqual(np.fromfile(root / "val.bin", dtype="<i4").tolist(), [99, 100])
+            self.assertTrue((root / "val.bin.partial").exists())
+
+    def test_finalize_never_replaces_raced_completion_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin.partial")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
+            original_link = os.link
+
+            def race(source: str | Path, destination: str | Path, *args: object, **kwargs: object) -> None:
+                if Path(destination).name == "metadata.json":
+                    Path(destination).write_text('{"race":true}', encoding="utf-8")
+                original_link(source, destination, *args, **kwargs)
+
+            with mock.patch.object(pp.os, "link", race):
+                with self.assertRaisesRegex(FileExistsError, "metadata.json"):
+                    pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+            self.assertEqual((root / "metadata.json").read_text(encoding="utf-8"), '{"race":true}')
+            self.assertEqual(list(root.glob(".metadata.json.*.partial")), [])
+
     def test_finalize_rejects_insufficient_validation_or_training_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -783,12 +905,12 @@ class FinalizationTests(unittest.TestCase):
             np.asarray([], dtype="<i4").tofile(root / "train.bin.partial")
             with self.assertRaisesRegex(RuntimeError, "validation"):
                 pp.finalize_outputs(
-                    root, self.run_identity(), self.manifest(), self.state(1, 1), 2, 1, 2
+                    root, self.run_identity(), self.manifest(1, 1), self.state(1, 1), 2, 1, 2
                 )
             np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin.partial")
             with self.assertRaisesRegex(RuntimeError, "training"):
                 pp.finalize_outputs(
-                    root, self.run_identity(), self.manifest(), self.state(2, 0), 2, 1, 2
+                    root, self.run_identity(), self.manifest(2, 0), self.state(2, 0), 2, 1, 2
                 )
 
     def test_finalize_rejects_partial_final_conflict_and_byte_mismatch(self) -> None:
@@ -837,13 +959,77 @@ class FinalizationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "different output directory"):
                 pp.load_completed_metadata(root, self.run_identity())
 
+    def test_finalize_rejects_inconsistent_run_manifest_or_state_before_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin.partial")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
+            run = self.run_identity()
+            source = pp.FileIdentity(0, "/different/000.parquet", 1, 1)
+            mismatched_manifest = pp.RunManifest(
+                "manifest", (pp.ShardResult(source, "/s.bin", "/s.json", 1, 0, 3),)
+            )
+            with self.assertRaisesRegex(RuntimeError, "sources"):
+                pp.finalize_outputs(root, run, mismatched_manifest, self.state(), 2, 1, 2)
+            inconsistent = pp.MergeState("manifest", 1, 8, 4, 0, 0, 3)
+            with self.assertRaisesRegex(RuntimeError, "counters"):
+                pp.finalize_outputs(root, run, self.manifest(), inconsistent, 2, 1, 2)
+            self.assertTrue((root / "val.bin.partial").exists())
+            self.assertTrue((root / "train.bin.partial").exists())
+
 
 class MainTests(unittest.TestCase):
+    def make_completed_resume_case(self, root: Path, *, both_final: bool) -> tuple[list[str], Path]:
+        inputs = root / "inputs"
+        inputs.mkdir()
+        source_path = inputs / "000.parquet"
+        pq.write_table(pa.table({"text": ["resume fixture"]}), source_path)
+        tokenizer = Path(pp.__file__).resolve().parents[1] / "tokenizer" / "tokenizer.model"
+        output = root / "output"
+        output.mkdir()
+        tokenizer_instance = pp.SentencePieceTokenizer(tokenizer)
+        run = pp.build_run_identity([source_path], tokenizer, tokenizer_instance.vocab_size, "text", False, True)
+        state_dir = output / ".preprocess"
+        task = pp.make_worker_tasks(run, state_dir, 1)[0]
+        result = pp.ShardResult(run.inputs[0], task.shard_path, task.sidecar_path, 1, 0, 3)
+        manifest = pp.write_run_manifest(state_dir, run.digest(), [result])
+        state = pp.MergeState(manifest.sha256, 1, 8, 4, 1, 0, 3)
+        pp.atomic_write_json(state_dir / "merge-state.json", pp.asdict(state))
+        np.asarray([1, 2], dtype="<i4").tofile(output / "val.bin")
+        target = output / ("train.bin" if both_final else "train.bin.partial")
+        np.asarray([3], dtype="<i4").tofile(target)
+        return [
+            "--input-glob", str(inputs / "*.parquet"), "--tokenizer", str(tokenizer),
+            "--output-dir", str(output), "--batch-size", "1", "--validation-tokens", "2", "--add-eos", "--resume",
+        ], output
+
+    def test_resume_finalizes_one_final_and_one_partial_without_workers_or_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            argv, output = self.make_completed_resume_case(Path(tmp), both_final=False)
+            with mock.patch.object(pp, "process_shards", side_effect=AssertionError("workers ran")), mock.patch.object(
+                pp, "merge_shards", side_effect=AssertionError("merge ran")
+            ):
+                self.assertEqual(pp.main(argv), 0)
+            self.assertEqual(np.fromfile(output / "val.bin", dtype="<i4").tolist(), [1, 2])
+            self.assertEqual(np.fromfile(output / "train.bin", dtype="<i4").tolist(), [3])
+            self.assertTrue((output / "metadata.json").is_file())
+
+    def test_resume_finalizes_two_existing_binaries_without_workers_or_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            argv, output = self.make_completed_resume_case(Path(tmp), both_final=True)
+            with mock.patch.object(pp, "process_shards", side_effect=AssertionError("workers ran")), mock.patch.object(
+                pp, "merge_shards", side_effect=AssertionError("merge ran")
+            ):
+                self.assertEqual(pp.main(argv), 0)
+            self.assertEqual(np.fromfile(output / "val.bin", dtype="<i4").tolist(), [1, 2])
+            self.assertEqual(np.fromfile(output / "train.bin", dtype="<i4").tolist(), [3])
+            self.assertTrue((output / "metadata.json").is_file())
+
     def test_resume_loads_context_before_processing_tasks(self) -> None:
         args = pp.parse_args(["--input-glob", "unused", "--resume"])
         run = FinalizationTests.run_identity()
-        manifest = pp.RunManifest("manifest", tuple())
-        state = pp.MergeState("manifest", 0, 4, 4, 1, 0, 2)
+        manifest = FinalizationTests.manifest()
+        state = pp.MergeState(manifest.sha256, 0, 0, 0, 0, 0, 0)
         events: list[str] = []
         with mock.patch.object(pp, "parse_args", return_value=args), mock.patch.object(
             pp, "prepare_output", return_value=Path("/tmp/output")
@@ -852,9 +1038,9 @@ class MainTests(unittest.TestCase):
         ), mock.patch.object(pp, "build_run_identity", return_value=run), mock.patch.object(
             pp, "print_disk_status"
         ), mock.patch.object(pp, "load_completed_metadata", return_value=None), mock.patch.object(
-            pp, "make_worker_tasks", return_value=[]
+            pp, "make_worker_tasks", return_value=[mock.sentinel.task]
         ), mock.patch.object(pp, "load_resume_context", side_effect=lambda *_: (events.append("context") or (manifest, state))), mock.patch.object(
-            pp, "process_shards", side_effect=lambda *_: events.append("process") or []
+            pp, "process_shards", side_effect=lambda *_: events.append("process") or list(manifest.results)
         ), mock.patch.object(pp, "merge_shards", return_value=state), mock.patch.object(
             pp, "finalize_outputs", return_value={"train_tokens": 1, "validation_tokens": 1}
         ):

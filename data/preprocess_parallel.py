@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import glob
 import hashlib
 import json
@@ -386,7 +387,11 @@ def _run_pending_tasks(
                 task = futures[future]
                 try:
                     result = future.result()
-                except BaseException as error:
+                except KeyboardInterrupt:
+                    for remaining in pending:
+                        remaining.cancel()
+                    raise
+                except Exception as error:
                     for remaining in pending:
                         remaining.cancel()
                     raise RuntimeError(f"failed to preprocess {task.source.path}") from error
@@ -788,19 +793,43 @@ def _path_exists(path: Path) -> bool:
 
 
 def _remove_tree_without_following_symlinks(path: Path) -> None:
-    """Remove a generated state tree without traversing any symlink."""
-    mode = path.lstat().st_mode
-    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-        path.unlink()
-        return
-    with os.scandir(path) as entries:
-        for entry in entries:
-            child = Path(entry.path)
-            if entry.is_dir(follow_symlinks=False):
-                _remove_tree_without_following_symlinks(child)
-            else:
-                child.unlink()
+    """Remove a generated state tree through no-follow directory descriptors."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            path.unlink()
+            return
+        raise
+    try:
+        _remove_directory_contents_without_following_symlinks(descriptor)
+    finally:
+        os.close(descriptor)
     path.rmdir()
+
+
+def _remove_directory_contents_without_following_symlinks(directory_fd: int) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    with os.scandir(os.dup(directory_fd)) as entries:
+        for entry in entries:
+            name = entry.name
+            try:
+                child_fd = os.open(name, flags, dir_fd=directory_fd)
+            except OSError as error:
+                if error.errno not in (errno.ENOTDIR, errno.ELOOP):
+                    raise
+                try:
+                    os.unlink(name, dir_fd=directory_fd)
+                except IsADirectoryError as changed:
+                    raise OSError(f"generated state entry changed while removing it: {name}") from changed
+                continue
+            try:
+                _remove_directory_contents_without_following_symlinks(child_fd)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
 
 
 def _remove_owned_outputs(output_dir: Path) -> None:
@@ -858,6 +887,63 @@ def _require_regular_file_size(path: Path, expected_size: int, label: str) -> No
         raise RuntimeError(f"{label} has unexpected byte size: {path} ({size} != {expected_size})")
 
 
+def _complete_link_publication(
+    partial: Path, final: Path, expected_bytes: int, label: str,
+) -> bool:
+    """Finish a hard-link publication interrupted before removal of its source."""
+    _require_regular_file_size(partial, expected_bytes, f"partial {label}")
+    _require_regular_file_size(final, expected_bytes, label)
+    partial_stat = partial.stat()
+    final_stat = final.stat()
+    if (partial_stat.st_dev, partial_stat.st_ino) != (final_stat.st_dev, final_stat.st_ino):
+        return False
+    partial.unlink()
+    _fsync_directory(final.parent)
+    return True
+
+
+def _publish_binary_no_replace(partial: Path, final: Path, expected_bytes: int, label: str) -> None:
+    _require_regular_file_size(partial, expected_bytes, f"partial {label}")
+    try:
+        os.link(partial, final, follow_symlinks=False)
+    except FileExistsError:
+        if _path_exists(partial) and _path_exists(final) and _complete_link_publication(
+            partial, final, expected_bytes, label
+        ):
+            return
+        raise RuntimeError(f"{label} destination already exists and was not published by this run") from None
+    _require_regular_file_size(final, expected_bytes, label)
+    partial_stat = partial.stat()
+    final_stat = final.stat()
+    if (partial_stat.st_dev, partial_stat.st_ino) != (final_stat.st_dev, final_stat.st_ino):
+        raise RuntimeError(f"{label} publication did not preserve the source inode")
+    partial.unlink()
+    _fsync_directory(final.parent)
+
+
+def _atomic_create_json(path: Path, payload: Mapping[str, object]) -> None:
+    """Atomically publish JSON only when its destination does not exist."""
+    _ensure_directory(path.parent)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".partial", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(payload, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path, follow_symlinks=False)
+        _fsync_directory(path.parent)
+        temporary.unlink()
+        _fsync_directory(path.parent)
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+
+
 def _final_metadata(
     run: RunIdentity, manifest: RunManifest, state: MergeState, batch_size: int, num_workers: int,
 ) -> dict[str, object]:
@@ -899,6 +985,15 @@ def _validate_finalization_inputs(
         raise ValueError("validation_tokens must be positive")
     if state.manifest_sha256 != manifest.sha256 or state.next_index != len(manifest.results):
         raise RuntimeError("merge state does not match completed run manifest")
+    if tuple(result.source for result in manifest.results) != run.inputs:
+        raise RuntimeError("run manifest sources do not match the current run")
+    expected_documents = sum(result.documents for result in manifest.results)
+    expected_skipped_documents = sum(result.skipped_documents for result in manifest.results)
+    expected_tokens = sum(result.tokens for result in manifest.results)
+    if (state.documents, state.skipped_documents, state.tokens) != (
+        expected_documents, expected_skipped_documents, expected_tokens,
+    ):
+        raise RuntimeError("merge state counters do not match completed run manifest")
     if state.validation_bytes % TOKEN_BYTES or state.training_bytes % TOKEN_BYTES:
         raise RuntimeError("merge state byte counts are not int32 aligned")
     if state.validation_bytes // TOKEN_BYTES != validation_tokens:
@@ -925,15 +1020,15 @@ def finalize_outputs(
     )
     for partial, final, expected_bytes, label in pairs:
         if _path_exists(partial) and _path_exists(final):
-            raise RuntimeError(f"cannot finalize {label}: both partial and final files exist")
+            if _complete_link_publication(partial, final, expected_bytes, label):
+                continue
+            raise RuntimeError(f"cannot finalize {label}: partial and final files have different inodes")
         if _path_exists(final):
             _require_regular_file_size(final, expected_bytes, label)
             continue
-        _require_regular_file_size(partial, expected_bytes, f"partial {label}")
-        os.replace(partial, final)
-        _fsync_directory(resolved)
+        _publish_binary_no_replace(partial, final, expected_bytes, label)
     metadata = _final_metadata(run, manifest, merge_state, batch_size, num_workers)
-    atomic_write_json(metadata_path, metadata)
+    _atomic_create_json(metadata_path, metadata)
     return metadata
 
 
@@ -1025,16 +1120,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     if resume_context is None:
         results = process_shards(tasks, run.tokenizer_path, args.num_workers, args.resume)
         manifest = write_run_manifest(state_dir, run.digest(), results)
+        merge_state = merge_shards(results, output_dir, args.validation_tokens, manifest, args.resume)
     else:
         manifest, previous_merge = resume_context
-        committed = list(manifest.results[:previous_merge.next_index])
-        remaining = process_shards(
-            tasks[previous_merge.next_index:], run.tokenizer_path, args.num_workers, True,
-        )
-        results = [*committed, *remaining]
-        if tuple(results) != manifest.results:
-            raise RuntimeError("rebuilt shard statistics differ from run manifest")
-    merge_state = merge_shards(results, output_dir, args.validation_tokens, manifest, args.resume)
+        if previous_merge.next_index == len(manifest.results):
+            merge_state = previous_merge
+        else:
+            committed = list(manifest.results[:previous_merge.next_index])
+            remaining = process_shards(
+                tasks[previous_merge.next_index:], run.tokenizer_path, args.num_workers, True,
+            )
+            results = [*committed, *remaining]
+            if tuple(results) != manifest.results:
+                raise RuntimeError("rebuilt shard statistics differ from run manifest")
+            merge_state = merge_shards(results, output_dir, args.validation_tokens, manifest, args.resume)
     metadata = finalize_outputs(
         output_dir, run, manifest, merge_state, args.batch_size, args.num_workers, args.validation_tokens,
     )
