@@ -145,6 +145,49 @@ TRAIN_ITERS=1000 \
 bash scripts/train_dual_single_node.sh
 ```
 
+For the default four-node baseline run, the controller node can launch all four
+SSH sessions with one script. Its defaults are the four documented cluster IPs,
+8 GPUs per node, 60,000 iterations, micro/global batch sizes 4/128, 2,000 warmup
+iterations, cosine decay, and validation/checkpoint intervals of 10,000:
+
+```bash
+DRY_RUN=1 bash scripts/launch_baseline_ssh.sh
+
+nohup bash scripts/launch_baseline_ssh.sh \
+  > baseline_4node_launcher.log 2>&1 < /dev/null &
+echo $! > baseline_4node_launcher.pid
+```
+
+The controller process must remain alive because it owns the SSH sessions.
+Monitor the controller and rank-zero logs with:
+
+```bash
+tail -f baseline_4node_launcher.log
+tail -f logs/baseline_4node_60k/baseline_node0.log
+```
+
+NCCL network selection is recorded during initialization. `NET/IB` indicates
+the RDMA path; `NET/Socket` indicates TCP fallback:
+
+```bash
+grep -Eh 'NET/IB|NET/Socket|Using network|mlx5' \
+  logs/baseline_4node_60k/baseline_node*.log | head -100
+```
+
+All launcher settings can be overridden through environment variables. For a
+short four-node smoke test:
+
+```bash
+TRAIN_ITERS=10 \
+WARMUP_ITERS=0 \
+OUTPUT_DIR=outputs/baseline_4node_smoke \
+LOG_DIR=logs/baseline_4node_smoke \
+bash scripts/launch_baseline_ssh.sh
+```
+
+Set `HOSTS` to a whitespace-separated, node-rank-ordered list to use another
+cluster. `MASTER_ADDR` defaults to the first host.
+
 ## Default configuration
 
 | Setting | Value |
