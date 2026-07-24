@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -17,6 +19,20 @@ from data import preprocess_parallel as pp
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_direct_script_help_runs_from_repository_root(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        completed = subprocess.run(
+            [sys.executable, "data/preprocess_parallel.py", "--help"],
+            cwd=repository,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--input-glob", completed.stdout)
+        self.assertIn("--num-workers", completed.stdout)
+        self.assertIn("--validation-tokens", completed.stdout)
+
     def test_discover_inputs_sorts_resolved_paths_and_limits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1232,6 +1248,37 @@ class MainTests(unittest.TestCase):
 
 
 class EndToEndTests(unittest.TestCase):
+    def test_direct_script_runs_single_spawn_worker(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            pq.write_table(pa.table({"text": ["alpha beta", "gamma delta"]}), inputs / "input.parquet")
+            output = root / "output"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "data/preprocess_parallel.py",
+                    "--input-glob", str(inputs / "*.parquet"),
+                    "--tokenizer", str(repository / "tokenizer" / "tokenizer.model"),
+                    "--output-dir", str(output),
+                    "--num-workers", "1",
+                    "--batch-size", "1",
+                    "--validation-tokens", "1",
+                    "--add-eos",
+                ],
+                cwd=repository,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue((output / "metadata.json").is_file())
+            self.assertTrue((output / "train.bin").is_file())
+            self.assertTrue((output / "val.bin").is_file())
+
     def test_one_and_two_workers_produce_identical_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

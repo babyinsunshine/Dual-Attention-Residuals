@@ -24,6 +24,11 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+if not __package__:
+    project_root = str(Path(__file__).resolve().parents[1])
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
 from data.tokenizer import SentencePieceTokenizer, TokenizerLike
 
 FORMAT_VERSION = 1
