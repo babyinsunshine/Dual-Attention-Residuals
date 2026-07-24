@@ -875,73 +875,123 @@ def _source_manifest_sha256(run: RunIdentity) -> str:
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
-def _require_regular_file_size(path: Path, expected_size: int, label: str) -> None:
+FileIdentityTuple = tuple[int, int, int]
+
+
+def _open_regular_file(
+    directory_fd: int, name: str, expected_size: int | None, label: str,
+) -> tuple[int, FileIdentityTuple]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
     try:
-        mode = path.lstat().st_mode
-        size = path.stat().st_size
-    except OSError as error:
-        raise RuntimeError(f"missing {label}: {path}") from error
-    if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
-        raise RuntimeError(f"{label} is not a regular file: {path}")
-    if size != expected_size:
-        raise RuntimeError(f"{label} has unexpected byte size: {path} ({size} != {expected_size})")
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise RuntimeError(f"{label} is not a regular file: {name}")
+        if expected_size is not None and status.st_size != expected_size:
+            raise RuntimeError(
+                f"{label} has unexpected byte size: {name} ({status.st_size} != {expected_size})"
+            )
+        return descriptor, (status.st_dev, status.st_ino, status.st_size)
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
-def _complete_link_publication(
-    partial: Path, final: Path, expected_bytes: int, label: str,
-) -> bool:
-    """Finish a hard-link publication interrupted before removal of its source."""
-    _require_regular_file_size(partial, expected_bytes, f"partial {label}")
-    _require_regular_file_size(final, expected_bytes, label)
-    partial_stat = partial.stat()
-    final_stat = final.stat()
-    if (partial_stat.st_dev, partial_stat.st_ino) != (final_stat.st_dev, final_stat.st_ino):
-        return False
-    partial.unlink()
-    _fsync_directory(final.parent)
-    return True
+def _open_output_directory(path: Path) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    return os.open(path, flags)
 
 
-def _publish_binary_no_replace(partial: Path, final: Path, expected_bytes: int, label: str) -> None:
-    _require_regular_file_size(partial, expected_bytes, f"partial {label}")
+def _verify_named_identity(
+    directory_fd: int, name: str, expected: FileIdentityTuple, label: str,
+) -> None:
+    descriptor, actual = _open_regular_file(directory_fd, name, expected[2], label)
     try:
-        os.link(partial, final, follow_symlinks=False)
-    except FileExistsError:
-        if _path_exists(partial) and _path_exists(final) and _complete_link_publication(
-            partial, final, expected_bytes, label
-        ):
-            return
-        raise RuntimeError(f"{label} destination already exists and was not published by this run") from None
-    _require_regular_file_size(final, expected_bytes, label)
-    partial_stat = partial.stat()
-    final_stat = final.stat()
-    if (partial_stat.st_dev, partial_stat.st_ino) != (final_stat.st_dev, final_stat.st_ino):
-        raise RuntimeError(f"{label} publication did not preserve the source inode")
-    partial.unlink()
-    _fsync_directory(final.parent)
+        if actual != expected:
+            raise RuntimeError(f"{label} changed after validation")
+    finally:
+        os.close(descriptor)
 
 
-def _atomic_create_json(path: Path, payload: Mapping[str, object]) -> None:
-    """Atomically publish JSON only when its destination does not exist."""
-    _ensure_directory(path.parent)
+def _unlink_owned_name(
+    directory_fd: int, name: str, expected: FileIdentityTuple, label: str,
+) -> None:
+    try:
+        _verify_named_identity(directory_fd, name, expected, label)
+    except FileNotFoundError:
+        return
+    os.unlink(name, dir_fd=directory_fd)
+
+
+def _publish_binary_no_replace(
+    directory_fd: int, partial_name: str, final_name: str, expected_bytes: int, label: str,
+) -> tuple[int, FileIdentityTuple]:
+    partial_fd, partial_identity = _open_regular_file(
+        directory_fd, partial_name, expected_bytes, f"partial {label}"
+    )
+    final_fd: int | None = None
+    published = False
+    try:
+        try:
+            os.link(
+                partial_name, final_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            final_fd, final_identity = _open_regular_file(directory_fd, final_name, expected_bytes, label)
+            if final_identity != partial_identity:
+                os.close(final_fd)
+                final_fd = None
+                raise RuntimeError(f"{label} destination already exists and has a different inode") from None
+        else:
+            final_fd, final_identity = _open_regular_file(directory_fd, final_name, expected_bytes, label)
+            if final_identity != partial_identity:
+                os.close(final_fd)
+                final_fd = None
+                raise RuntimeError(f"{label} publication did not preserve the validated partial inode")
+        _unlink_owned_name(directory_fd, partial_name, partial_identity, f"partial {label}")
+        published = True
+        return final_fd, final_identity
+    finally:
+        os.close(partial_fd)
+        if final_fd is not None and not published:
+            os.close(final_fd)
+
+
+def _atomic_create_json(
+    directory_fd: int, directory: Path, name: str, payload: Mapping[str, object],
+) -> FileIdentityTuple:
+    """Atomically link JSON into place and return the created inode identity."""
     temporary: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".partial", delete=False,
+            "w", encoding="utf-8", dir=directory, prefix=f".{name}.", suffix=".partial", delete=False,
         ) as stream:
             temporary = Path(stream.name)
             json.dump(payload, stream, indent=2, sort_keys=True)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.link(temporary, path, follow_symlinks=False)
-        _fsync_directory(path.parent)
+            status = os.fstat(stream.fileno())
+            identity = (status.st_dev, status.st_ino, status.st_size)
+        os.link(temporary, name, dst_dir_fd=directory_fd, follow_symlinks=False)
+        _fsync_directory(directory)
         temporary.unlink()
-        _fsync_directory(path.parent)
+        _fsync_directory(directory)
+        return identity
     except BaseException:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
         raise
+
+
+def _unlink_if_identity(directory_fd: int, directory: Path, name: str, expected: FileIdentityTuple) -> None:
+    try:
+        _verify_named_identity(directory_fd, name, expected, "completion metadata")
+    except (FileNotFoundError, RuntimeError):
+        return
+    os.unlink(name, dir_fd=directory_fd)
+    _fsync_directory(directory)
 
 
 def _final_metadata(
@@ -1011,25 +1061,65 @@ def finalize_outputs(
     _validate_finalization_inputs(run, manifest, merge_state, batch_size, num_workers, validation_tokens)
     resolved = output_dir.resolve(strict=False)
     _ensure_directory(resolved)
-    metadata_path = resolved / "metadata.json"
-    if _path_exists(metadata_path):
-        raise FileExistsError(f"refusing to replace existing completion metadata: {metadata_path}")
     pairs = (
-        (resolved / "val.bin.partial", resolved / "val.bin", merge_state.validation_bytes, "validation output"),
-        (resolved / "train.bin.partial", resolved / "train.bin", merge_state.training_bytes, "training output"),
+        ("val.bin.partial", "val.bin", merge_state.validation_bytes, "validation output"),
+        ("train.bin.partial", "train.bin", merge_state.training_bytes, "training output"),
     )
-    for partial, final, expected_bytes, label in pairs:
-        if _path_exists(partial) and _path_exists(final):
-            if _complete_link_publication(partial, final, expected_bytes, label):
-                continue
-            raise RuntimeError(f"cannot finalize {label}: partial and final files have different inodes")
-        if _path_exists(final):
-            _require_regular_file_size(final, expected_bytes, label)
-            continue
-        _publish_binary_no_replace(partial, final, expected_bytes, label)
-    metadata = _final_metadata(run, manifest, merge_state, batch_size, num_workers)
-    _atomic_create_json(metadata_path, metadata)
-    return metadata
+    directory_fd = _open_output_directory(resolved)
+    held_finals: list[tuple[int, FileIdentityTuple, str, str]] = []
+    try:
+        try:
+            existing_metadata, _ = _open_regular_file(directory_fd, "metadata.json", None, "completion metadata")
+        except FileNotFoundError:
+            pass
+        else:
+            os.close(existing_metadata)
+            raise FileExistsError(f"refusing to replace existing completion metadata: {resolved / 'metadata.json'}")
+        for partial_name, final_name, expected_bytes, label in pairs:
+            try:
+                final_fd, final_identity = _open_regular_file(
+                    directory_fd, final_name, expected_bytes, label
+                )
+            except FileNotFoundError:
+                final_fd, final_identity = _publish_binary_no_replace(
+                    directory_fd, partial_name, final_name, expected_bytes, label
+                )
+            else:
+                try:
+                    try:
+                        partial_fd, partial_identity = _open_regular_file(
+                            directory_fd, partial_name, expected_bytes, f"partial {label}"
+                        )
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        os.close(partial_fd)
+                        if partial_identity != final_identity:
+                            raise RuntimeError(
+                                f"cannot finalize {label}: partial and final files have different inodes"
+                            )
+                        _unlink_owned_name(
+                            directory_fd, partial_name, partial_identity, f"partial {label}"
+                        )
+                except BaseException:
+                    os.close(final_fd)
+                    raise
+            held_finals.append((final_fd, final_identity, final_name, label))
+        for _, identity, name, label in held_finals:
+            _verify_named_identity(directory_fd, name, identity, label)
+        metadata = _final_metadata(run, manifest, merge_state, batch_size, num_workers)
+        metadata_identity = _atomic_create_json(directory_fd, resolved, "metadata.json", metadata)
+        try:
+            for _, identity, name, label in held_finals:
+                _verify_named_identity(directory_fd, name, identity, label)
+        except BaseException:
+            _unlink_if_identity(directory_fd, resolved, "metadata.json", metadata_identity)
+            raise
+        return metadata
+    finally:
+        for descriptor, _, _, _ in held_finals:
+            os.close(descriptor)
+        os.close(directory_fd)
 
 
 def _completed_metadata_error() -> RuntimeError:
@@ -1039,13 +1129,18 @@ def _completed_metadata_error() -> RuntimeError:
 
 
 def load_completed_metadata(output_dir: Path, run: RunIdentity) -> dict[str, object] | None:
-    path = output_dir.resolve(strict=False) / "metadata.json"
-    if not _path_exists(path):
-        return None
+    resolved = output_dir.resolve(strict=False)
+    directory_fd = _open_output_directory(resolved)
     try:
-        if path.is_symlink():
-            raise OSError("metadata is a symlink")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            metadata_fd, _ = _open_regular_file(directory_fd, "metadata.json", None, "completion metadata")
+        except FileNotFoundError:
+            return None
+        try:
+            with os.fdopen(os.dup(metadata_fd), "r", encoding="utf-8") as stream:
+                payload = json.load(stream)
+        finally:
+            os.close(metadata_fd)
         if not isinstance(payload, dict):
             raise ValueError("metadata is not an object")
         expected_keys = set(_final_metadata(run, RunManifest("placeholder", tuple()), MergeState(
@@ -1083,12 +1178,26 @@ def load_completed_metadata(output_dir: Path, run: RunIdentity) -> dict[str, obj
             or payload["total_tokens"] != payload["train_tokens"] + payload["validation_tokens"]
         ):
             raise ValueError("metadata values differ")
-        _require_regular_file_size(output_dir.resolve(strict=False) / "train.bin", payload["train_tokens"] * TOKEN_BYTES, "training output")
-        _require_regular_file_size(output_dir.resolve(strict=False) / "val.bin", payload["validation_tokens"] * TOKEN_BYTES, "validation output")
+        train_fd: int | None = None
+        val_fd: int | None = None
+        try:
+            train_fd, _ = _open_regular_file(
+                directory_fd, "train.bin", payload["train_tokens"] * TOKEN_BYTES, "training output"
+            )
+            val_fd, _ = _open_regular_file(
+                directory_fd, "val.bin", payload["validation_tokens"] * TOKEN_BYTES, "validation output"
+            )
+        finally:
+            if train_fd is not None:
+                os.close(train_fd)
+            if val_fd is not None:
+                os.close(val_fd)
     except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
         if isinstance(error, RuntimeError) and str(error) == str(_completed_metadata_error()):
             raise
         raise _completed_metadata_error() from error
+    finally:
+        os.close(directory_fd)
     return payload
 
 

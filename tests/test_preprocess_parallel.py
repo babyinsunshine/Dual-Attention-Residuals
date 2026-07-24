@@ -870,8 +870,9 @@ class FinalizationTests(unittest.TestCase):
             original_link = os.link
 
             def race(source: str | Path, destination: str | Path, *args: object, **kwargs: object) -> None:
-                if Path(destination).name == "val.bin":
-                    np.asarray([99, 100], dtype="<i4").tofile(destination)
+                destination_path = root / Path(destination).name
+                if destination_path.name == "val.bin":
+                    np.asarray([99, 100], dtype="<i4").tofile(destination_path)
                 original_link(source, destination, *args, **kwargs)
 
             with mock.patch.object(pp.os, "link", race):
@@ -888,8 +889,9 @@ class FinalizationTests(unittest.TestCase):
             original_link = os.link
 
             def race(source: str | Path, destination: str | Path, *args: object, **kwargs: object) -> None:
-                if Path(destination).name == "metadata.json":
-                    Path(destination).write_text('{"race":true}', encoding="utf-8")
+                destination_path = root / Path(destination).name
+                if destination_path.name == "metadata.json":
+                    destination_path.write_text('{"race":true}', encoding="utf-8")
                 original_link(source, destination, *args, **kwargs)
 
             with mock.patch.object(pp.os, "link", race):
@@ -897,6 +899,143 @@ class FinalizationTests(unittest.TestCase):
                     pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
             self.assertEqual((root / "metadata.json").read_text(encoding="utf-8"), '{"race":true}')
             self.assertEqual(list(root.glob(".metadata.json.*.partial")), [])
+
+    def test_finalize_rejects_partial_swapped_before_hard_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            partial = root / "val.bin.partial"
+            np.asarray([1, 2], dtype="<i4").tofile(partial)
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
+            original_link = os.link
+
+            def swap_then_link(source: str | Path, destination: str | Path, *args: object, **kwargs: object) -> None:
+                if Path(destination).name == "val.bin":
+                    partial.unlink()
+                    np.asarray([90, 91], dtype="<i4").tofile(partial)
+                original_link(source, destination, *args, **kwargs)
+
+            with mock.patch.object(pp.os, "link", swap_then_link):
+                with self.assertRaisesRegex(RuntimeError, "inode"):
+                    pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+            self.assertFalse((root / "metadata.json").exists())
+
+    def test_finalize_rejects_final_swapped_before_metadata_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin")
+            original_create = pp._atomic_create_json
+
+            def swap_then_create(*args: object, **kwargs: object) -> object:
+                (root / "val.bin").unlink()
+                np.asarray([90, 91], dtype="<i4").tofile(root / "val.bin")
+                return original_create(*args, **kwargs)
+
+            with mock.patch.object(pp, "_atomic_create_json", swap_then_create):
+                with self.assertRaisesRegex(RuntimeError, "changed"):
+                    pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+            self.assertFalse((root / "metadata.json").exists())
+
+    def test_finalize_rolls_back_only_its_metadata_when_final_swaps_after_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin")
+            original_create = pp._atomic_create_json
+
+            def create_then_swap(*args: object, **kwargs: object) -> object:
+                result = original_create(*args, **kwargs)
+                (root / "val.bin").unlink()
+                np.asarray([90, 91], dtype="<i4").tofile(root / "val.bin")
+                return result
+
+            with mock.patch.object(pp, "_atomic_create_json", create_then_swap):
+                with self.assertRaisesRegex(RuntimeError, "changed"):
+                    pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+            self.assertFalse((root / "metadata.json").exists())
+
+    def test_finalize_never_unlinks_raced_metadata_during_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin")
+            original_create = pp._atomic_create_json
+
+            def create_then_swap_everything(*args: object, **kwargs: object) -> object:
+                result = original_create(*args, **kwargs)
+                (root / "metadata.json").unlink()
+                (root / "metadata.json").write_text('{"racer":true}', encoding="utf-8")
+                (root / "val.bin").unlink()
+                np.asarray([90, 91], dtype="<i4").tofile(root / "val.bin")
+                return result
+
+            with mock.patch.object(pp, "_atomic_create_json", create_then_swap_everything):
+                with self.assertRaisesRegex(RuntimeError, "changed"):
+                    pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+            self.assertEqual((root / "metadata.json").read_text(encoding="utf-8"), '{"racer":true}')
+
+    def test_finalize_rejects_symlink_substitution_at_validation_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside.bin"
+            np.asarray([90, 91], dtype="<i4").tofile(outside)
+            partial = root / "val.bin.partial"
+            np.asarray([1, 2], dtype="<i4").tofile(partial)
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
+            original_link = os.link
+
+            def symlink_then_link(source: str | Path, destination: str | Path, *args: object, **kwargs: object) -> None:
+                if Path(destination).name == "val.bin":
+                    partial.unlink()
+                    partial.symlink_to(outside)
+                original_link(source, destination, *args, **kwargs)
+
+            with mock.patch.object(pp.os, "link", symlink_then_link):
+                with self.assertRaises(OSError):
+                    pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+            self.assertFalse((root / "metadata.json").exists())
+            (root / "val.bin").unlink(missing_ok=True)
+            partial.unlink(missing_ok=True)
+            (root / "train.bin.partial").unlink(missing_ok=True)
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin")
+            original_create = pp._atomic_create_json
+
+            def symlink_then_create(*args: object, **kwargs: object) -> object:
+                (root / "val.bin").unlink()
+                (root / "val.bin").symlink_to(outside)
+                return original_create(*args, **kwargs)
+
+            with mock.patch.object(pp, "_atomic_create_json", symlink_then_create):
+                with self.assertRaises(OSError):
+                    pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+            self.assertFalse((root / "metadata.json").exists())
+
+    def test_finalize_closes_descriptors_when_partial_cleanup_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin.partial")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
+            before = len(list(Path("/proc/self/fd").iterdir()))
+            with mock.patch.object(pp, "_unlink_owned_name", side_effect=OSError("cleanup failed")):
+                with self.assertRaisesRegex(OSError, "cleanup failed"):
+                    pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+            after = len(list(Path("/proc/self/fd").iterdir()))
+            self.assertEqual(after, before)
+
+    def test_finalize_closes_existing_final_descriptor_when_recovery_cleanup_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            partial = root / "val.bin.partial"
+            np.asarray([1, 2], dtype="<i4").tofile(partial)
+            os.link(partial, root / "val.bin")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
+            before = len(list(Path("/proc/self/fd").iterdir()))
+            with mock.patch.object(pp, "_unlink_owned_name", side_effect=OSError("cleanup failed")):
+                with self.assertRaisesRegex(OSError, "cleanup failed"):
+                    pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+            after = len(list(Path("/proc/self/fd").iterdir()))
+            self.assertEqual(after, before)
 
     def test_finalize_rejects_insufficient_validation_or_training_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -958,6 +1097,22 @@ class FinalizationTests(unittest.TestCase):
             (root / "train.bin").write_bytes(b"bad")
             with self.assertRaisesRegex(RuntimeError, "different output directory"):
                 pp.load_completed_metadata(root, self.run_identity())
+
+    def test_completed_metadata_closes_descriptors_when_final_validation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin.partial")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
+            pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+            outside = root / "outside.bin"
+            np.asarray([90, 91], dtype="<i4").tofile(outside)
+            (root / "val.bin").unlink()
+            (root / "val.bin").symlink_to(outside)
+            before = len(list(Path("/proc/self/fd").iterdir()))
+            with self.assertRaisesRegex(RuntimeError, "different output directory"):
+                pp.load_completed_metadata(root, self.run_identity())
+            after = len(list(Path("/proc/self/fd").iterdir()))
+            self.assertEqual(after, before)
 
     def test_finalize_rejects_inconsistent_run_manifest_or_state_before_publish(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
