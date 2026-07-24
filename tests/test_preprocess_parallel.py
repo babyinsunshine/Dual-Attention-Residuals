@@ -1242,12 +1242,118 @@ class MainTests(unittest.TestCase):
             self.assertEqual(pp.main([]), 0)
         self.assertEqual(events, ["context", "process"])
 
+    def test_main_selects_merge_resume_mode_from_loaded_context(self) -> None:
+        args = pp.parse_args(["--input-glob", "unused", "--resume"])
+        run = FinalizationTests.run_identity()
+        manifest = FinalizationTests.manifest()
+        incomplete = pp.MergeState(manifest.sha256, 0, 0, 0, 0, 0, 0)
+        complete = pp.MergeState(manifest.sha256, 1, 8, 4, 1, 0, 3)
+        for context, expected_resume in ((None, False), ((manifest, incomplete), True)):
+            with self.subTest(context_loaded=context is not None), mock.patch.object(
+                pp, "parse_args", return_value=args
+            ), mock.patch.object(
+                pp, "prepare_output", return_value=Path("/tmp/output")
+            ), mock.patch.object(
+                pp, "discover_inputs", return_value=[]
+            ), mock.patch.object(
+                pp, "SentencePieceTokenizer", return_value=mock.Mock(vocab_size=131072)
+            ), mock.patch.object(
+                pp, "build_run_identity", return_value=run
+            ), mock.patch.object(
+                pp, "print_disk_status"
+            ), mock.patch.object(
+                pp, "load_completed_metadata", return_value=None
+            ), mock.patch.object(
+                pp, "make_worker_tasks", return_value=[mock.sentinel.task]
+            ), mock.patch.object(
+                pp, "load_resume_context", return_value=context
+            ), mock.patch.object(
+                pp, "process_shards", return_value=list(manifest.results)
+            ), mock.patch.object(
+                pp, "write_run_manifest", return_value=manifest
+            ), mock.patch.object(
+                pp, "merge_shards", return_value=complete
+            ) as merge, mock.patch.object(
+                pp, "finalize_outputs", return_value={"train_tokens": 1, "validation_tokens": 1}
+            ):
+                self.assertEqual(pp.main([]), 0)
+                self.assertIs(merge.call_args.args[4], expected_resume)
+
     def test_sigterm_handler_only_interrupts(self) -> None:
         with self.assertRaisesRegex(KeyboardInterrupt, "received signal 15"):
             pp._interrupt_on_sigterm(15, None)
 
 
 class EndToEndTests(unittest.TestCase):
+    def test_direct_script_resume_on_new_output(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "input.parquet"
+            pq.write_table(pa.table({"text": ["alpha beta", "gamma delta"]}), source)
+            output = root / "output"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "data/preprocess_parallel.py",
+                    "--input-glob", str(source),
+                    "--tokenizer", str(repository / "tokenizer" / "tokenizer.model"),
+                    "--output-dir", str(output),
+                    "--num-workers", "1",
+                    "--batch-size", "1",
+                    "--validation-tokens", "1",
+                    "--add-eos",
+                    "--resume",
+                ],
+                cwd=repository,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue((output / "metadata.json").is_file())
+
+    def test_resume_reuses_shard_created_before_manifest_and_starts_fresh_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            for index, text in enumerate(("alpha beta", "gamma delta")):
+                pq.write_table(pa.table({"text": [text]}), inputs / f"{index}.parquet")
+            tokenizer = Path(pp.__file__).resolve().parents[1] / "tokenizer" / "tokenizer.model"
+            output = pp.prepare_output(root / "output", overwrite=False, resume=True)
+            sources = pp.discover_inputs(str(inputs / "*.parquet"), max_files=None)
+            run = pp.build_run_identity(
+                sources, tokenizer, pp.EXPECTED_VOCAB_SIZE, "text", False, True
+            )
+            tasks = pp.make_worker_tasks(run, output / ".preprocess", batch_size=1)
+            previous_tokenizer = pp._WORKER_TOKENIZER
+            try:
+                pp._WORKER_TOKENIZER = pp.SentencePieceTokenizer(tokenizer)
+                reused = pp.tokenize_file(tasks[0])
+            finally:
+                pp._WORKER_TOKENIZER = previous_tokenizer
+            self.assertFalse((output / ".preprocess" / "run-manifest.json").exists())
+            self.assertFalse((output / ".preprocess" / "merge-state.json").exists())
+
+            with mock.patch.object(pp, "_run_pending_tasks", wraps=pp._run_pending_tasks) as pending:
+                exit_code = pp.main([
+                    "--input-glob", str(inputs / "*.parquet"),
+                    "--tokenizer", str(tokenizer),
+                    "--output-dir", str(output),
+                    "--num-workers", "1",
+                    "--batch-size", "1",
+                    "--validation-tokens", "1",
+                    "--add-eos",
+                    "--resume",
+                ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual([task.source.index for task in pending.call_args.args[0]], [1])
+            self.assertEqual(pending.call_args.args[3], [reused])
+            self.assertTrue((output / "metadata.json").is_file())
+
     def test_direct_script_runs_single_spawn_worker(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmp:

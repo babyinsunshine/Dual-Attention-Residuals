@@ -1253,7 +1253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if resume_context is None:
         results = process_shards(tasks, run.tokenizer_path, args.num_workers, args.resume)
         manifest = write_run_manifest(state_dir, run.digest(), results)
-        merge_state = merge_shards(results, output_dir, args.validation_tokens, manifest, args.resume)
+        merge_state = merge_shards(results, output_dir, args.validation_tokens, manifest, False)
     else:
         manifest, previous_merge = resume_context
         if previous_merge.next_index == len(manifest.results):
@@ -1266,7 +1266,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             results = [*committed, *remaining]
             if tuple(results) != manifest.results:
                 raise RuntimeError("rebuilt shard statistics differ from run manifest")
-            merge_state = merge_shards(results, output_dir, args.validation_tokens, manifest, args.resume)
+            merge_state = merge_shards(results, output_dir, args.validation_tokens, manifest, True)
     metadata = finalize_outputs(
         output_dir, run, manifest, merge_state, args.batch_size, args.num_workers, args.validation_tokens,
     )
