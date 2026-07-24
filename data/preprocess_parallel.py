@@ -10,9 +10,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from data.tokenizer import SentencePieceTokenizer, TokenizerLike
+
 FORMAT_VERSION = 1
 TOKEN_DTYPE = "<i4"
 EXPECTED_VOCAB_SIZE = 131_072
+
+_WORKER_TOKENIZER: TokenizerLike | None = None
 
 
 def positive_int(value: str) -> int:
@@ -102,6 +110,137 @@ class RunIdentity:
     def digest(self) -> str:
         raw = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class WorkerTask:
+    source: FileIdentity
+    shard_path: str
+    sidecar_path: str
+    tokenizer_sha256: str
+    text_column: str
+    batch_size: int
+    add_bos: bool
+    add_eos: bool
+
+
+@dataclass(frozen=True)
+class ShardResult:
+    source: FileIdentity
+    shard_path: str
+    sidecar_path: str
+    documents: int
+    skipped_documents: int
+    tokens: int
+
+    def to_json(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_json(cls, payload: Mapping[str, object]) -> "ShardResult":
+        return cls(
+            source=FileIdentity(**dict(payload["source"])),
+            shard_path=str(payload["shard_path"]),
+            sidecar_path=str(payload["sidecar_path"]),
+            documents=int(payload["documents"]),
+            skipped_documents=int(payload["skipped_documents"]),
+            tokens=int(payload["tokens"]),
+        )
+
+
+def initialize_worker(tokenizer_path: str) -> None:
+    global _WORKER_TOKENIZER
+    pa.set_cpu_count(1)
+    _WORKER_TOKENIZER = SentencePieceTokenizer(tokenizer_path)
+
+
+def load_valid_shard(task: WorkerTask) -> ShardResult | None:
+    shard = Path(task.shard_path)
+    sidecar = Path(task.sidecar_path)
+    if not shard.is_file() or not sidecar.is_file():
+        return None
+    try:
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or set(payload) != {"task", "result"}:
+            return None
+        if payload["task"] != asdict(task) or not isinstance(payload["result"], dict):
+            return None
+        result = ShardResult.from_json(payload["result"])
+        if (
+            payload["result"] != result.to_json()
+            or result.source != task.source
+            or result.shard_path != task.shard_path
+            or result.sidecar_path != task.sidecar_path
+            or result.documents < 0
+            or result.skipped_documents < 0
+            or result.tokens < 0
+            or shard.stat().st_size != result.tokens * np.dtype(TOKEN_DTYPE).itemsize
+        ):
+            return None
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+        return None
+    return result
+
+
+def tokenize_file(task: WorkerTask) -> ShardResult:
+    if _WORKER_TOKENIZER is None:
+        raise RuntimeError("worker tokenizer is not initialized")
+    shard = Path(task.shard_path)
+    sidecar = Path(task.sidecar_path)
+    shard.parent.mkdir(parents=True, exist_ok=True)
+    partial = shard.with_suffix(shard.suffix + ".partial")
+    partial.unlink(missing_ok=True)
+    documents = skipped = tokens = 0
+    try:
+        parquet = pq.ParquetFile(task.source.path)
+        if task.text_column not in parquet.schema_arrow.names:
+            raise ValueError(f"missing text column {task.text_column!r}: {task.source.path}")
+        with partial.open("wb") as output:
+            for batch in parquet.iter_batches(
+                batch_size=task.batch_size, columns=[task.text_column], use_threads=False
+            ):
+                values = batch.column(0).to_pylist()
+                texts = [value for value in values if isinstance(value, str) and value.strip()]
+                skipped += len(values) - len(texts)
+                encoded = _WORKER_TOKENIZER.encode_batch(
+                    texts, add_bos=task.add_bos, add_eos=task.add_eos
+                )
+                for token_ids in encoded:
+                    if not token_ids:
+                        skipped += 1
+                        continue
+                    if min(token_ids) < -(2**31) or max(token_ids) >= 2**31:
+                        raise OverflowError(f"token ID outside int32 range in {task.source.path}")
+                    array = np.asarray(token_ids, dtype=TOKEN_DTYPE)
+                    array.tofile(output)
+                    tokens += int(array.size)
+                    documents += 1
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(partial, shard)
+        result = ShardResult(task.source, str(shard), str(sidecar), documents, skipped, tokens)
+        atomic_write_json(sidecar, {"task": asdict(task), "result": result.to_json()})
+        return result
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+
+
+def make_worker_tasks(run: RunIdentity, state_dir: Path, batch_size: int) -> list[WorkerTask]:
+    shard_dir = state_dir / "shards"
+    return [
+        WorkerTask(
+            source=source,
+            shard_path=str(shard_dir / f"{source.index:06d}.bin"),
+            sidecar_path=str(shard_dir / f"{source.index:06d}.json"),
+            tokenizer_sha256=run.tokenizer_sha256,
+            text_column=run.text_column,
+            batch_size=batch_size,
+            add_bos=run.add_bos,
+            add_eos=run.add_eos,
+        )
+        for source in run.inputs
+    ]
 
 
 def discover_inputs(pattern: str, max_files: int | None) -> list[Path]:
