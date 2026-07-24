@@ -160,6 +160,28 @@ class WorkerTests(unittest.TestCase):
             Path(result.sidecar_path).write_text(json.dumps(payload))
             self.assertIsNone(pp.load_valid_shard(task))
 
+    def test_load_valid_shard_rejects_numeric_and_boolean_type_substitutions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task = self.make_task(Path(tmp))
+            pp._WORKER_TOKENIZER = FakeTokenizer()
+            result = pp.tokenize_file(task)
+            original = Path(result.sidecar_path).read_text()
+            substitutions = (
+                ("task", "batch_size", 2.0),
+                ("task", "add_eos", 1),
+                ("result", "tokens", 6.0),
+                ("result", "documents", True),
+            )
+            for section, field, value in substitutions:
+                payload = json.loads(original)
+                payload[section][field] = value
+                Path(result.sidecar_path).write_text(json.dumps(payload))
+                self.assertIsNone(pp.load_valid_shard(task), (section, field, value))
+            payload = json.loads(original)
+            payload["result"]["source"]["index"] = False
+            Path(result.sidecar_path).write_text(json.dumps(payload))
+            self.assertIsNone(pp.load_valid_shard(task), "result.source.index")
+
     def test_tokenize_file_rejects_token_ids_outside_int32(self) -> None:
         class OverflowTokenizer(FakeTokenizer):
             def encode_batch(self, texts, *, add_bos=False, add_eos=False):
@@ -168,5 +190,27 @@ class WorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             task = self.make_task(Path(tmp))
             pp._WORKER_TOKENIZER = OverflowTokenizer()
+            with self.assertRaisesRegex(OverflowError, "int32"):
+                pp.tokenize_file(task)
+
+    def test_tokenize_file_accepts_lowest_int32_token_id(self) -> None:
+        class MinimumTokenizer(FakeTokenizer):
+            def encode_batch(self, texts, *, add_bos=False, add_eos=False):
+                return [[-(2**31)] for _ in texts]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            task = self.make_task(Path(tmp))
+            pp._WORKER_TOKENIZER = MinimumTokenizer()
+            result = pp.tokenize_file(task)
+            self.assertEqual(np.fromfile(result.shard_path, dtype="<i4").tolist(), [-(2**31), -(2**31)])
+
+    def test_tokenize_file_rejects_token_ids_below_int32(self) -> None:
+        class UnderflowTokenizer(FakeTokenizer):
+            def encode_batch(self, texts, *, add_bos=False, add_eos=False):
+                return [[-(2**31) - 1] for _ in texts]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            task = self.make_task(Path(tmp))
+            pp._WORKER_TOKENIZER = UnderflowTokenizer()
             with self.assertRaisesRegex(OverflowError, "int32"):
                 pp.tokenize_file(task)

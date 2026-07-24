@@ -154,6 +154,10 @@ def initialize_worker(tokenizer_path: str) -> None:
     _WORKER_TOKENIZER = SentencePieceTokenizer(tokenizer_path)
 
 
+def canonical_json(payload: object) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
 def load_valid_shard(task: WorkerTask) -> ShardResult | None:
     shard = Path(task.shard_path)
     sidecar = Path(task.sidecar_path)
@@ -163,11 +167,29 @@ def load_valid_shard(task: WorkerTask) -> ShardResult | None:
         payload = json.loads(sidecar.read_text(encoding="utf-8"))
         if not isinstance(payload, dict) or set(payload) != {"task", "result"}:
             return None
-        if payload["task"] != asdict(task) or not isinstance(payload["result"], dict):
-            return None
-        result = ShardResult.from_json(payload["result"])
         if (
-            payload["result"] != result.to_json()
+            not isinstance(payload["task"], dict)
+            or canonical_json(payload["task"]) != canonical_json(asdict(task))
+            or not isinstance(payload["result"], dict)
+        ):
+            return None
+        raw_result = payload["result"]
+        if (
+            set(raw_result) != {
+                "source", "shard_path", "sidecar_path", "documents", "skipped_documents", "tokens"
+            }
+            or canonical_json(raw_result["source"]) != canonical_json(asdict(task.source))
+            or canonical_json(raw_result["shard_path"]) != canonical_json(task.shard_path)
+            or canonical_json(raw_result["sidecar_path"]) != canonical_json(task.sidecar_path)
+            or any(
+                type(raw_result[field]) is not int
+                for field in ("documents", "skipped_documents", "tokens")
+            )
+        ):
+            return None
+        result = ShardResult.from_json(raw_result)
+        if (
+            canonical_json(raw_result) != canonical_json(result.to_json())
             or result.source != task.source
             or result.shard_path != task.shard_path
             or result.sidecar_path != task.sidecar_path
