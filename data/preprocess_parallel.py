@@ -4,6 +4,7 @@ import argparse
 import glob
 import hashlib
 import json
+import math
 import os
 import tempfile
 import time
@@ -281,6 +282,24 @@ def summarize_progress(
     )
 
 
+def _validate_scheduler_inputs(tasks: Sequence[WorkerTask], num_workers: int) -> None:
+    if type(num_workers) is not int or num_workers < 1:
+        raise ValueError("num_workers must be positive")
+    indexes = [task.source.index for task in tasks]
+    if len(indexes) != len(set(indexes)):
+        raise ValueError("duplicate source indexes are not allowed")
+
+
+def _validate_heartbeat(heartbeat_seconds: float) -> None:
+    if (
+        isinstance(heartbeat_seconds, bool)
+        or not isinstance(heartbeat_seconds, (int, float))
+        or not math.isfinite(heartbeat_seconds)
+        or heartbeat_seconds <= 0
+    ):
+        raise ValueError("heartbeat_seconds must be a finite positive number")
+
+
 def _run_pending_tasks(
     tasks: Sequence[WorkerTask],
     tokenizer_path: str,
@@ -291,6 +310,8 @@ def _run_pending_tasks(
     heartbeat_seconds: float,
     emit: Callable[[str], None],
 ) -> list[ShardResult]:
+    _validate_scheduler_inputs(tasks, num_workers)
+    _validate_heartbeat(heartbeat_seconds)
     completed_results = list(already_done)
     results: list[ShardResult] = []
     with ProcessPoolExecutor(
@@ -330,6 +351,8 @@ def process_shards(
     heartbeat_seconds: float = 30.0,
     emit: Callable[[str], None] = print,
 ) -> list[ShardResult]:
+    _validate_scheduler_inputs(tasks, num_workers)
+    _validate_heartbeat(heartbeat_seconds)
     started_at = time.monotonic()
     reused: list[ShardResult] = []
     pending: list[WorkerTask] = []
@@ -357,7 +380,7 @@ def process_shards(
     results = sorted([*reused, *built], key=lambda item: item.source.index)
     expected_indexes = [task.source.index for task in tasks]
     actual_indexes = [item.source.index for item in results]
-    if actual_indexes != expected_indexes:
+    if len(actual_indexes) != len(set(actual_indexes)) or actual_indexes != expected_indexes:
         raise RuntimeError(
             f"shard results do not match input tasks: expected {expected_indexes}, got {actual_indexes}"
         )

@@ -267,6 +267,55 @@ class ProgressTests(unittest.TestCase):
             results = pp.process_shards(tasks, "tokenizer.model", 4, True)
         self.assertEqual([item.source.index for item in results], [4, 5])
 
+    def test_process_shards_rejects_duplicate_task_indexes_before_executor(self) -> None:
+        tasks = self.make_tasks(4, 4)
+        with mock.patch.object(pp, "_run_pending_tasks", side_effect=AssertionError("executor ran")):
+            with self.assertRaisesRegex(ValueError, "duplicate source indexes"):
+                pp.process_shards(tasks, "tokenizer.model", 4, False, emit=lambda _: None)
+
+    def test_run_pending_tasks_rejects_duplicate_task_indexes_before_executor(self) -> None:
+        tasks = self.make_tasks(4, 4)
+        with mock.patch.object(pp, "ProcessPoolExecutor", side_effect=AssertionError("executor ran")):
+            with self.assertRaisesRegex(ValueError, "duplicate source indexes"):
+                pp._run_pending_tasks(tasks, "tokenizer.model", 4, [], 2, 0.0, 1.0, lambda _: None)
+
+    def test_process_shards_rejects_duplicate_and_missing_or_extra_result_indexes(self) -> None:
+        tasks = self.make_tasks(4, 5)
+        malformed_results = (
+            [self.make_result(tasks[0]), self.make_result(tasks[0])],
+            [
+                self.make_result(tasks[0]),
+                pp.ShardResult(
+                    pp.FileIdentity(6, "/6.parquet", 10, 20),
+                    "/6.bin",
+                    "/6.json",
+                    2,
+                    0,
+                    8,
+                ),
+            ],
+        )
+        for built in malformed_results:
+            with self.subTest(indexes=[item.source.index for item in built]), mock.patch.object(
+                pp, "load_valid_shard", return_value=None
+            ), mock.patch.object(pp, "_run_pending_tasks", return_value=built):
+                with self.assertRaisesRegex(RuntimeError, "shard results do not match"):
+                    pp.process_shards(tasks, "tokenizer.model", 4, True, emit=lambda _: None)
+
+    def test_process_shards_empty_task_list_skips_executor(self) -> None:
+        with mock.patch.object(pp, "_run_pending_tasks", side_effect=AssertionError("executor ran")):
+            self.assertEqual(pp.process_shards([], "tokenizer.model", 4, True, emit=lambda _: None), [])
+
+    def test_direct_api_rejects_invalid_heartbeat_and_worker_counts(self) -> None:
+        task = self.make_tasks(0)[0]
+        invalid_heartbeats = (0.0, -1.0, float("nan"), float("inf"), float("-inf"))
+        for heartbeat in invalid_heartbeats:
+            with self.subTest(heartbeat=heartbeat), self.assertRaisesRegex(ValueError, "heartbeat_seconds"):
+                pp._run_pending_tasks([task], "tokenizer.model", 1, [], 1, 0.0, heartbeat, lambda _: None)
+        for workers in (0, -1):
+            with self.subTest(workers=workers), self.assertRaisesRegex(ValueError, "num_workers"):
+                pp.process_shards([], "tokenizer.model", workers, True, emit=lambda _: None)
+
     def test_summarize_progress_contains_counts_and_rate(self) -> None:
         result = pp.ShardResult(pp.FileIdentity(0, "/a", 1, 1), "/a.bin", "/a.json", 4, 1, 100)
         message = pp.summarize_progress([result], total=2, started_at=10.0, now=20.0)
@@ -284,7 +333,7 @@ class ProgressTests(unittest.TestCase):
         executor.__enter__.return_value = executor
         executor.submit.return_value = future
         messages: list[str] = []
-        with mock.patch.object(pp, "ProcessPoolExecutor", return_value=executor), mock.patch.object(
+        with mock.patch.object(pp, "ProcessPoolExecutor", return_value=executor) as process_pool, mock.patch.object(
             pp, "wait", side_effect=[(set(), {future}), ({future}, set())]
         ), mock.patch.object(pp, "get_context", return_value="spawn-context"):
             results = pp._run_pending_tasks(
@@ -295,6 +344,12 @@ class ProgressTests(unittest.TestCase):
         self.assertTrue(all("files=" in message for message in messages))
         executor.submit.assert_called_once_with(pp.tokenize_file, task)
         executor.__enter__.assert_called_once_with()
+        process_pool.assert_called_once_with(
+            max_workers=2,
+            mp_context="spawn-context",
+            initializer=pp.initialize_worker,
+            initargs=("tokenizer.model",),
+        )
 
     def test_run_pending_tasks_reports_worker_path_and_cancels_remaining_work(self) -> None:
         tasks = self.make_tasks(4, 5)
