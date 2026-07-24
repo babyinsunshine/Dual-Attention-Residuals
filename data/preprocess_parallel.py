@@ -6,6 +6,10 @@ import hashlib
 import json
 import math
 import os
+import shutil
+import signal
+import stat
+import sys
 import tempfile
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
@@ -25,6 +29,9 @@ TOKEN_DTYPE = "<i4"
 EXPECTED_VOCAB_SIZE = 131_072
 TOKEN_BYTES = np.dtype(TOKEN_DTYPE).itemsize
 COPY_TOKENS = 16_777_216
+OWNED_FINAL_NAMES = (
+    "train.bin", "val.bin", "metadata.json", "train.bin.partial", "val.bin.partial",
+)
 
 _WORKER_TOKENIZER: TokenizerLike | None = None
 
@@ -773,3 +780,278 @@ def build_run_identity(
         add_bos=add_bos,
         add_eos=add_eos,
     )
+
+
+def _path_exists(path: Path) -> bool:
+    """Return whether a directory entry exists, including a dangling symlink."""
+    return os.path.lexists(path)
+
+
+def _remove_tree_without_following_symlinks(path: Path) -> None:
+    """Remove a generated state tree without traversing any symlink."""
+    mode = path.lstat().st_mode
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        path.unlink()
+        return
+    with os.scandir(path) as entries:
+        for entry in entries:
+            child = Path(entry.path)
+            if entry.is_dir(follow_symlinks=False):
+                _remove_tree_without_following_symlinks(child)
+            else:
+                child.unlink()
+    path.rmdir()
+
+
+def _remove_owned_outputs(output_dir: Path) -> None:
+    changed = False
+    for name in OWNED_FINAL_NAMES:
+        candidate = output_dir / name
+        if not _path_exists(candidate):
+            continue
+        mode = candidate.lstat().st_mode
+        if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
+            raise RuntimeError(f"owned output path is unexpectedly a directory: {candidate}")
+        candidate.unlink()
+        changed = True
+    state_dir = output_dir / ".preprocess"
+    if _path_exists(state_dir):
+        if state_dir.parent != output_dir or state_dir.name != ".preprocess":
+            raise RuntimeError(f"refusing to remove an unexpected preprocessing state directory: {state_dir}")
+        _remove_tree_without_following_symlinks(state_dir)
+        changed = True
+    if changed:
+        _fsync_directory(output_dir)
+
+
+def prepare_output(output_dir: Path, overwrite: bool, resume: bool) -> Path:
+    if overwrite and resume:
+        raise ValueError("--overwrite and --resume are mutually exclusive")
+    resolved = output_dir.resolve(strict=False)
+    _ensure_directory(resolved)
+    state_dir = resolved / ".preprocess"
+    occupied = any(_path_exists(resolved / name) for name in OWNED_FINAL_NAMES)
+    if occupied or _path_exists(state_dir):
+        if overwrite:
+            _remove_owned_outputs(resolved)
+        elif not resume:
+            raise FileExistsError(
+                f"output already contains preprocessing files: {resolved}; use --resume or --overwrite"
+            )
+    return resolved
+
+
+def _source_manifest_sha256(run: RunIdentity) -> str:
+    payload = [asdict(source) for source in run.inputs]
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _require_regular_file_size(path: Path, expected_size: int, label: str) -> None:
+    try:
+        mode = path.lstat().st_mode
+        size = path.stat().st_size
+    except OSError as error:
+        raise RuntimeError(f"missing {label}: {path}") from error
+    if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+        raise RuntimeError(f"{label} is not a regular file: {path}")
+    if size != expected_size:
+        raise RuntimeError(f"{label} has unexpected byte size: {path} ({size} != {expected_size})")
+
+
+def _final_metadata(
+    run: RunIdentity, manifest: RunManifest, state: MergeState, batch_size: int, num_workers: int,
+) -> dict[str, object]:
+    validation_tokens = state.validation_bytes // TOKEN_BYTES
+    training_tokens = state.training_bytes // TOKEN_BYTES
+    return {
+        "format_version": FORMAT_VERSION,
+        "run_sha256": run.digest(),
+        "manifest_sha256": manifest.sha256,
+        "source_files": len(run.inputs),
+        "source_manifest_sha256": _source_manifest_sha256(run),
+        "documents": state.documents,
+        "skipped_documents": state.skipped_documents,
+        "train_tokens": training_tokens,
+        "validation_tokens": validation_tokens,
+        "total_tokens": training_tokens + validation_tokens,
+        "dtype": "int32",
+        "byte_order": "little",
+        "tokenizer_path": run.tokenizer_path,
+        "tokenizer_sha256": run.tokenizer_sha256,
+        "vocab_size": run.vocab_size,
+        "add_bos": run.add_bos,
+        "add_eos": run.add_eos,
+        "text_column": run.text_column,
+        "num_workers": num_workers,
+        "batch_size": batch_size,
+    }
+
+
+def _validate_finalization_inputs(
+    run: RunIdentity, manifest: RunManifest, state: MergeState, batch_size: int, num_workers: int,
+    validation_tokens: int,
+) -> None:
+    if type(run) is not RunIdentity or type(manifest) is not RunManifest or type(state) is not MergeState:
+        raise RuntimeError("invalid preprocessing completion records")
+    if type(batch_size) is not int or batch_size < 1 or type(num_workers) is not int or num_workers < 1:
+        raise ValueError("batch_size and num_workers must be positive")
+    if type(validation_tokens) is not int or validation_tokens < 1:
+        raise ValueError("validation_tokens must be positive")
+    if state.manifest_sha256 != manifest.sha256 or state.next_index != len(manifest.results):
+        raise RuntimeError("merge state does not match completed run manifest")
+    if state.validation_bytes % TOKEN_BYTES or state.training_bytes % TOKEN_BYTES:
+        raise RuntimeError("merge state byte counts are not int32 aligned")
+    if state.validation_bytes // TOKEN_BYTES != validation_tokens:
+        raise RuntimeError("merge did not produce the requested validation token count")
+    if state.training_bytes // TOKEN_BYTES <= 0:
+        raise RuntimeError("merge did not produce positive training tokens")
+    if state.tokens != (state.validation_bytes + state.training_bytes) // TOKEN_BYTES:
+        raise RuntimeError("merge state token count does not match output byte counts")
+
+
+def finalize_outputs(
+    output_dir: Path, run: RunIdentity, manifest: RunManifest, merge_state: MergeState,
+    batch_size: int, num_workers: int, validation_tokens: int,
+) -> dict[str, object]:
+    _validate_finalization_inputs(run, manifest, merge_state, batch_size, num_workers, validation_tokens)
+    resolved = output_dir.resolve(strict=False)
+    _ensure_directory(resolved)
+    metadata_path = resolved / "metadata.json"
+    if _path_exists(metadata_path):
+        raise FileExistsError(f"refusing to replace existing completion metadata: {metadata_path}")
+    pairs = (
+        (resolved / "val.bin.partial", resolved / "val.bin", merge_state.validation_bytes, "validation output"),
+        (resolved / "train.bin.partial", resolved / "train.bin", merge_state.training_bytes, "training output"),
+    )
+    for partial, final, expected_bytes, label in pairs:
+        if _path_exists(partial) and _path_exists(final):
+            raise RuntimeError(f"cannot finalize {label}: both partial and final files exist")
+        if _path_exists(final):
+            _require_regular_file_size(final, expected_bytes, label)
+            continue
+        _require_regular_file_size(partial, expected_bytes, f"partial {label}")
+        os.replace(partial, final)
+        _fsync_directory(resolved)
+    metadata = _final_metadata(run, manifest, merge_state, batch_size, num_workers)
+    atomic_write_json(metadata_path, metadata)
+    return metadata
+
+
+def _completed_metadata_error() -> RuntimeError:
+    return RuntimeError(
+        "completed preprocessing output does not match this run; use a different output directory or explicit --overwrite"
+    )
+
+
+def load_completed_metadata(output_dir: Path, run: RunIdentity) -> dict[str, object] | None:
+    path = output_dir.resolve(strict=False) / "metadata.json"
+    if not _path_exists(path):
+        return None
+    try:
+        if path.is_symlink():
+            raise OSError("metadata is a symlink")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("metadata is not an object")
+        expected_keys = set(_final_metadata(run, RunManifest("placeholder", tuple()), MergeState(
+            "placeholder", 0, TOKEN_BYTES, TOKEN_BYTES, 0, 0, 2
+        ), 1, 1))
+        if set(payload) != expected_keys:
+            raise ValueError("metadata schema differs")
+        int_keys = {
+            "format_version", "source_files", "documents", "skipped_documents", "train_tokens",
+            "validation_tokens", "total_tokens", "vocab_size", "num_workers", "batch_size",
+        }
+        str_keys = {
+            "run_sha256", "manifest_sha256", "source_manifest_sha256", "dtype", "byte_order",
+            "tokenizer_path", "tokenizer_sha256", "text_column",
+        }
+        if any(type(payload[key]) is not int for key in int_keys) or any(
+            type(payload[key]) is not str for key in str_keys
+        ) or type(payload["add_bos"]) is not bool or type(payload["add_eos"]) is not bool:
+            raise ValueError("metadata types differ")
+        if (
+            payload["format_version"] != FORMAT_VERSION
+            or payload["run_sha256"] != run.digest()
+            or payload["tokenizer_sha256"] != run.tokenizer_sha256
+            or payload["tokenizer_path"] != run.tokenizer_path
+            or payload["vocab_size"] != run.vocab_size
+            or payload["source_files"] != len(run.inputs)
+            or payload["source_manifest_sha256"] != _source_manifest_sha256(run)
+            or payload["add_bos"] != run.add_bos
+            or payload["add_eos"] != run.add_eos
+            or payload["text_column"] != run.text_column
+            or payload["dtype"] != "int32"
+            or payload["byte_order"] != "little"
+            or payload["train_tokens"] <= 0
+            or payload["validation_tokens"] < 1
+            or payload["total_tokens"] != payload["train_tokens"] + payload["validation_tokens"]
+        ):
+            raise ValueError("metadata values differ")
+        _require_regular_file_size(output_dir.resolve(strict=False) / "train.bin", payload["train_tokens"] * TOKEN_BYTES, "training output")
+        _require_regular_file_size(output_dir.resolve(strict=False) / "val.bin", payload["validation_tokens"] * TOKEN_BYTES, "validation output")
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
+        if isinstance(error, RuntimeError) and str(error) == str(_completed_metadata_error()):
+            raise
+        raise _completed_metadata_error() from error
+    return payload
+
+
+def print_disk_status(output_dir: Path, full_run: bool) -> None:
+    usage = shutil.disk_usage(output_dir)
+    free_gib = usage.free / (1024 ** 3)
+    print(f"disk free at {output_dir}: {free_gib:.1f} GiB")
+    if full_run and free_gib < 450:
+        print(f"warning: only {free_gib:.1f} GiB free; a full run needs substantially more disk", file=sys.stderr)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    output_dir = prepare_output(Path(args.output_dir), args.overwrite, args.resume)
+    inputs = discover_inputs(args.input_glob, args.max_files)
+    tokenizer = SentencePieceTokenizer(Path(args.tokenizer).resolve())
+    if tokenizer.vocab_size != EXPECTED_VOCAB_SIZE:
+        raise ValueError(f"expected a {EXPECTED_VOCAB_SIZE}-piece tokenizer, got {tokenizer.vocab_size}")
+    run = build_run_identity(
+        inputs, Path(args.tokenizer), tokenizer.vocab_size, args.text_column, args.add_bos, args.add_eos,
+    )
+    print_disk_status(output_dir, full_run=args.max_files is None)
+    if args.resume and load_completed_metadata(output_dir, run) is not None:
+        print(f"preprocessing already complete: {output_dir}")
+        return 0
+    state_dir = output_dir / ".preprocess"
+    tasks = make_worker_tasks(run, state_dir, args.batch_size)
+    resume_context = load_resume_context(state_dir, run.digest()) if args.resume else None
+    if resume_context is None:
+        results = process_shards(tasks, run.tokenizer_path, args.num_workers, args.resume)
+        manifest = write_run_manifest(state_dir, run.digest(), results)
+    else:
+        manifest, previous_merge = resume_context
+        committed = list(manifest.results[:previous_merge.next_index])
+        remaining = process_shards(
+            tasks[previous_merge.next_index:], run.tokenizer_path, args.num_workers, True,
+        )
+        results = [*committed, *remaining]
+        if tuple(results) != manifest.results:
+            raise RuntimeError("rebuilt shard statistics differ from run manifest")
+    merge_state = merge_shards(results, output_dir, args.validation_tokens, manifest, args.resume)
+    metadata = finalize_outputs(
+        output_dir, run, manifest, merge_state, args.batch_size, args.num_workers, args.validation_tokens,
+    )
+    print(
+        f"wrote {metadata['train_tokens']:,} training and "
+        f"{metadata['validation_tokens']:,} validation tokens to {output_dir}"
+    )
+    return 0
+
+
+def _interrupt_on_sigterm(signum: int, frame: object) -> None:
+    raise KeyboardInterrupt(f"received signal {signum}")
+
+
+if __name__ == "__main__":
+    previous = signal.signal(signal.SIGTERM, _interrupt_on_sigterm)
+    try:
+        raise SystemExit(main())
+    finally:
+        signal.signal(signal.SIGTERM, previous)

@@ -691,3 +691,203 @@ class MergeTests(unittest.TestCase):
             self.assertTrue((state_dir / "merge-state.json").exists())
             pp.merge_shards([result], root, 1, manifest, resume=True)
             self.assertFalse(Path(result.shard_path).exists())
+
+
+class FinalizationTests(unittest.TestCase):
+    @staticmethod
+    def run_identity() -> pp.RunIdentity:
+        return pp.RunIdentity(1, tuple(), "/tokenizer.model", "abc", 131072, "text", False, True)
+
+    @staticmethod
+    def manifest() -> pp.RunManifest:
+        return pp.RunManifest("manifest", tuple())
+
+    @staticmethod
+    def state(validation_tokens: int = 2, training_tokens: int = 1) -> pp.MergeState:
+        return pp.MergeState(
+            "manifest", 0, validation_tokens * 4, training_tokens * 4, 1, 0,
+            validation_tokens + training_tokens,
+        )
+
+    def test_existing_final_output_requires_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "train.bin").write_bytes(b"user-data")
+            with self.assertRaisesRegex(FileExistsError, "--overwrite"):
+                pp.prepare_output(root, overwrite=False, resume=False)
+            self.assertEqual((root / "train.bin").read_bytes(), b"user-data")
+
+    def test_existing_preprocess_state_requires_resume_or_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".preprocess").mkdir()
+            with self.assertRaisesRegex(FileExistsError, "--resume"):
+                pp.prepare_output(root, overwrite=False, resume=False)
+
+    def test_overwrite_removes_only_owned_names_without_following_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside"
+            outside.mkdir()
+            target = outside / "user-data"
+            target.write_bytes(b"keep")
+            (root / "train.bin").symlink_to(target)
+            (root / "unrelated.txt").write_text("keep", encoding="utf-8")
+            state = root / ".preprocess"
+            state.mkdir()
+            (state / "link").symlink_to(outside, target_is_directory=True)
+            pp.prepare_output(root, overwrite=True, resume=False)
+            self.assertFalse((root / "train.bin").exists())
+            self.assertEqual(target.read_bytes(), b"keep")
+            self.assertEqual((root / "unrelated.txt").read_text(encoding="utf-8"), "keep")
+            self.assertFalse(state.exists())
+
+    def test_overwrite_syncs_output_directory_after_named_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "train.bin").write_bytes(b"generated")
+            with mock.patch.object(pp, "_fsync_directory") as sync:
+                pp.prepare_output(root, overwrite=True, resume=False)
+            self.assertIn(mock.call(root.resolve()), sync.call_args_list)
+
+    def test_finalize_writes_metadata_last_and_renames_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin.partial")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
+            metadata = pp.finalize_outputs(
+                root, self.run_identity(), self.manifest(), self.state(), batch_size=2,
+                num_workers=1, validation_tokens=2,
+            )
+            self.assertTrue((root / "train.bin").is_file())
+            self.assertTrue((root / "val.bin").is_file())
+            self.assertEqual(json.loads((root / "metadata.json").read_text()), metadata)
+
+    def test_finalize_recovers_when_binaries_were_already_renamed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin")
+            pp.finalize_outputs(
+                root, self.run_identity(), self.manifest(), self.state(), batch_size=2,
+                num_workers=1, validation_tokens=2,
+            )
+            self.assertTrue((root / "metadata.json").is_file())
+            self.assertEqual(np.fromfile(root / "val.bin", dtype="<i4").tolist(), [1, 2])
+            self.assertEqual(np.fromfile(root / "train.bin", dtype="<i4").tolist(), [3])
+
+    def test_finalize_rejects_insufficient_validation_or_training_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            np.asarray([1], dtype="<i4").tofile(root / "val.bin.partial")
+            np.asarray([], dtype="<i4").tofile(root / "train.bin.partial")
+            with self.assertRaisesRegex(RuntimeError, "validation"):
+                pp.finalize_outputs(
+                    root, self.run_identity(), self.manifest(), self.state(1, 1), 2, 1, 2
+                )
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin.partial")
+            with self.assertRaisesRegex(RuntimeError, "training"):
+                pp.finalize_outputs(
+                    root, self.run_identity(), self.manifest(), self.state(2, 0), 2, 1, 2
+                )
+
+    def test_finalize_rejects_partial_final_conflict_and_byte_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin")
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin.partial")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
+            with self.assertRaisesRegex(RuntimeError, "partial and final"):
+                pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+            (root / "val.bin.partial").unlink()
+            (root / "val.bin").write_bytes(b"bad")
+            with self.assertRaisesRegex(RuntimeError, "byte size"):
+                pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+
+    def test_finalize_never_replaces_existing_completion_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin.partial")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
+            (root / "metadata.json").write_text('{"user":"data"}', encoding="utf-8")
+            with self.assertRaisesRegex(FileExistsError, "metadata.json"):
+                pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+            self.assertEqual((root / "metadata.json").read_text(encoding="utf-8"), '{"user":"data"}')
+
+    def test_completed_metadata_requires_exact_schema_hashes_and_sizes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin.partial")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
+            metadata = pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
+            self.assertEqual(pp.load_completed_metadata(root, self.run_identity()), metadata)
+            for key, value in (("run_sha256", "wrong"), ("train_tokens", 2.0)):
+                tampered = dict(metadata)
+                tampered[key] = value
+                (root / "metadata.json").write_text(json.dumps(tampered), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "different output directory"):
+                    pp.load_completed_metadata(root, self.run_identity())
+            tampered = dict(metadata)
+            tampered["unexpected"] = True
+            (root / "metadata.json").write_text(json.dumps(tampered), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "different output directory"):
+                pp.load_completed_metadata(root, self.run_identity())
+            (root / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+            (root / "train.bin").write_bytes(b"bad")
+            with self.assertRaisesRegex(RuntimeError, "different output directory"):
+                pp.load_completed_metadata(root, self.run_identity())
+
+
+class MainTests(unittest.TestCase):
+    def test_resume_loads_context_before_processing_tasks(self) -> None:
+        args = pp.parse_args(["--input-glob", "unused", "--resume"])
+        run = FinalizationTests.run_identity()
+        manifest = pp.RunManifest("manifest", tuple())
+        state = pp.MergeState("manifest", 0, 4, 4, 1, 0, 2)
+        events: list[str] = []
+        with mock.patch.object(pp, "parse_args", return_value=args), mock.patch.object(
+            pp, "prepare_output", return_value=Path("/tmp/output")
+        ), mock.patch.object(pp, "discover_inputs", return_value=[]), mock.patch.object(
+            pp, "SentencePieceTokenizer", return_value=mock.Mock(vocab_size=131072)
+        ), mock.patch.object(pp, "build_run_identity", return_value=run), mock.patch.object(
+            pp, "print_disk_status"
+        ), mock.patch.object(pp, "load_completed_metadata", return_value=None), mock.patch.object(
+            pp, "make_worker_tasks", return_value=[]
+        ), mock.patch.object(pp, "load_resume_context", side_effect=lambda *_: (events.append("context") or (manifest, state))), mock.patch.object(
+            pp, "process_shards", side_effect=lambda *_: events.append("process") or []
+        ), mock.patch.object(pp, "merge_shards", return_value=state), mock.patch.object(
+            pp, "finalize_outputs", return_value={"train_tokens": 1, "validation_tokens": 1}
+        ):
+            self.assertEqual(pp.main([]), 0)
+        self.assertEqual(events, ["context", "process"])
+
+    def test_sigterm_handler_only_interrupts(self) -> None:
+        with self.assertRaisesRegex(KeyboardInterrupt, "received signal 15"):
+            pp._interrupt_on_sigterm(15, None)
+
+
+class EndToEndTests(unittest.TestCase):
+    def test_one_and_two_workers_produce_identical_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            pq.write_table(pa.table({"text": ["alpha beta", "gamma delta"]}), inputs / "b.parquet")
+            pq.write_table(pa.table({"text": ["epsilon zeta", "eta theta"]}), inputs / "a.parquet")
+            tokenizer = Path(pp.__file__).resolve().parents[1] / "tokenizer" / "tokenizer.model"
+            outputs = []
+            for workers in (1, 2):
+                output = root / f"out-{workers}"
+                exit_code = pp.main([
+                    "--input-glob", str(inputs / "*.parquet"),
+                    "--tokenizer", str(tokenizer),
+                    "--output-dir", str(output),
+                    "--num-workers", str(workers),
+                    "--batch-size", "1",
+                    "--validation-tokens", "5",
+                    "--add-eos",
+                ])
+                self.assertEqual(exit_code, 0)
+                outputs.append(output)
+            self.assertEqual((outputs[0] / "val.bin").read_bytes(), (outputs[1] / "val.bin").read_bytes())
+            self.assertEqual((outputs[0] / "train.bin").read_bytes(), (outputs[1] / "train.bin").read_bytes())
