@@ -57,10 +57,19 @@ For data conversion only, avoid installing Transformer Engine or Megatron-Core:
 uv pip install numpy==1.26.4 pyarrow==21.0.0 sentencepiece==0.2.1
 ```
 
-If Transformer Engine has no usable prebuilt wheel for the server, follow its
-published source-build prerequisites instead of mixing incompatible wheels. A
-CUDA toolkit and `nvcc` are needed only for that source-build fallback, not for
-using a compatible prebuilt PyTorch/Transformer Engine wheel.
+If Transformer Engine has no usable prebuilt wheel for the server, use the
+[NVIDIA Transformer Engine source repository](https://github.com/NVIDIA/TransformerEngine)
+only after PyTorch and its source-build prerequisites (a compiler, CUDA toolkit
+with `nvcc`, and CUDA headers) are available:
+
+```bash
+NVTE_FRAMEWORK=pytorch uv pip install --no-build-isolation \
+  'git+https://github.com/NVIDIA/TransformerEngine.git@v2.10'
+```
+
+This is a source-build fallback; `v2.10` corresponds to this repository's
+pinned `transformer-engine[pytorch]==2.10.0`. A CUDA toolkit and `nvcc` are not
+needed when using a compatible prebuilt PyTorch/Transformer Engine wheel.
 
 ### Prepare data
 
@@ -109,11 +118,13 @@ python data/preprocess_parallel.py \
 
 Expect about 400 GB of output; reserve at least 450 GiB of free space. The
 converter emits a heartbeat every 30 seconds. Re-running with identical
-arguments and `--resume` deterministically continues the same job. Source
+arguments and `--resume` deterministically continues the same job. `--resume`
+may be supplied from the first invocation: it reuses completed per-file shards
+before a merge journal exists, then resumes journaled merging afterward. Source
 Parquet files are read-only throughout. A successful output directory contains
 `train.bin`, `val.bin`, and completion marker `metadata.json`; the validation
-file has exactly 10,000,000 tokens in the full command. Safe final publication
-requires Linux support for `renameat2(RENAME_NOREPLACE)`.
+file has exactly 10,000,000 tokens in the full command. Safe final-output
+publication requires Linux support for `renameat2(RENAME_NOREPLACE)`.
 
 ### Train
 
