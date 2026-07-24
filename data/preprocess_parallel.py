@@ -10,6 +10,7 @@ import math
 import os
 import shutil
 import signal
+import secrets
 import stat
 import sys
 import tempfile
@@ -278,6 +279,7 @@ def tokenize_file(task: WorkerTask) -> ShardResult:
     partial.unlink(missing_ok=True)
     documents = skipped = tokens = 0
     try:
+        _require_source_identity(task.source)
         parquet = pq.ParquetFile(task.source.path)
         if task.text_column not in parquet.schema_arrow.names:
             raise ValueError(f"missing text column {task.text_column!r}: {task.source.path}")
@@ -303,6 +305,7 @@ def tokenize_file(task: WorkerTask) -> ShardResult:
                     documents += 1
             output.flush()
             os.fsync(output.fileno())
+        _require_source_identity(task.source)
         os.replace(partial, shard)
         result = ShardResult(task.source, str(shard), str(sidecar), documents, skipped, tokens)
         atomic_write_json(sidecar, {"task": asdict(task), "result": result.to_json()})
@@ -310,6 +313,22 @@ def tokenize_file(task: WorkerTask) -> ShardResult:
     except BaseException:
         partial.unlink(missing_ok=True)
         raise
+
+
+def _require_source_identity(source: FileIdentity) -> None:
+    """Require that a worker reads exactly the immutable input it was assigned."""
+    try:
+        resolved = Path(source.path).resolve(strict=True)
+        status = resolved.stat()
+    except OSError as error:
+        raise RuntimeError(f"source identity changed: {source.path}") from error
+    if (
+        str(resolved) != source.path
+        or not stat.S_ISREG(status.st_mode)
+        or status.st_size != source.size
+        or status.st_mtime_ns != source.mtime_ns
+    ):
+        raise RuntimeError(f"source identity changed: {source.path}")
 
 
 def make_worker_tasks(run: RunIdentity, state_dir: Path, batch_size: int) -> list[WorkerTask]:
@@ -374,13 +393,16 @@ def _run_pending_tasks(
     _validate_heartbeat(heartbeat_seconds)
     completed_results = list(already_done)
     results: list[ShardResult] = []
-    with ProcessPoolExecutor(
+    executor = ProcessPoolExecutor(
         max_workers=num_workers,
         mp_context=get_context("spawn"),
         initializer=initialize_worker,
         initargs=(tokenizer_path,),
-    ) as executor:
-        futures = {executor.submit(tokenize_file, task): task for task in tasks}
+    )
+    futures: dict[object, WorkerTask] = {}
+    try:
+        for task in tasks:
+            futures[executor.submit(tokenize_file, task)] = task
         pending = set(futures)
         while pending:
             completed, pending = wait(
@@ -393,18 +415,39 @@ def _run_pending_tasks(
                 task = futures[future]
                 try:
                     result = future.result()
-                except KeyboardInterrupt:
-                    for remaining in pending:
-                        remaining.cancel()
-                    raise
                 except Exception as error:
-                    for remaining in pending:
-                        remaining.cancel()
                     raise RuntimeError(f"failed to preprocess {task.source.path}") from error
                 results.append(result)
                 completed_results.append(result)
             emit(summarize_progress(completed_results, total, started_at))
+    except BaseException:
+        _abort_process_pool(executor, futures)
+        raise
+    else:
+        executor.shutdown(wait=True)
     return results
+
+
+def _abort_process_pool(executor: ProcessPoolExecutor, futures: Mapping[object, WorkerTask]) -> None:
+    """Cancel queued work and terminate running spawned workers without waiting first.
+
+    ``ProcessPoolExecutor`` on Python 3.10 has no public terminate-workers API;
+    the private process map is used only here so SIGTERM/KeyboardInterrupt does
+    not block in its context-manager ``shutdown(wait=True)`` path.
+    """
+    for future in futures:
+        future.cancel()
+    process_map = getattr(executor, "_processes", None)
+    processes = tuple(process_map.values()) if isinstance(process_map, dict) else ()
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except (AttributeError, TypeError):  # pragma: no cover - Python < 3.9 fallback
+        executor.shutdown(wait=False)
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    for process in processes:
+        process.join()
 
 
 def process_shards(
@@ -640,7 +683,7 @@ def load_resume_context(state_dir: Path, run_sha256: str) -> tuple[RunManifest, 
     manifest_exists, state_exists = manifest_path.exists(), state_path.exists()
     if not manifest_exists and not state_exists:
         return None
-    if manifest_exists != state_exists:
+    if state_exists and not manifest_exists:
         raise RuntimeError("resume requires both run-manifest.json and merge-state.json")
     try:
         manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -648,6 +691,13 @@ def load_resume_context(state_dir: Path, run_sha256: str) -> tuple[RunManifest, 
         raise RuntimeError(f"invalid run manifest: {manifest_path}") from error
     manifest = _manifest_from_payload(manifest_payload, run_sha256)
     _validate_generated_shard_paths(manifest.results, state_dir)
+    if not state_exists:
+        # A crash after manifest publication but before the first journal entry
+        # is a valid zero-commit recovery point.  Persist it before returning so
+        # later recovery has one durable, validated interpretation.
+        initial = _initial_merge_state(manifest)
+        atomic_write_json(state_path, asdict(initial))
+        return manifest, initial
     return manifest, _load_merge_state(state_path, manifest)
 
 
@@ -703,8 +753,10 @@ def merge_shards(
     training_path = output_dir / "train.bin.partial"
     if resume:
         if not state_path.is_file():
-            raise RuntimeError(f"resume requires an existing merge-state.json: {state_path}")
-        state = _load_merge_state(state_path, run_manifest)
+            state = _initial_merge_state(run_manifest)
+            atomic_write_json(state_path, asdict(state))
+        else:
+            state = _load_merge_state(state_path, run_manifest)
     else:
         if state_path.exists():
             raise RuntimeError(f"fresh merge refuses existing merge state: {state_path}")
@@ -883,11 +935,12 @@ def _source_manifest_sha256(run: RunIdentity) -> str:
 
 FileIdentityTuple = tuple[int, int, int]
 RENAME_NOREPLACE = 1
-AT_FDCWD = -100
 
 
-def _rename_no_replace(source: Path, destination: Path) -> None:
-    """Linux renameat2(RENAME_NOREPLACE), used only for same-directory outputs."""
+def _rename_no_replace(
+    source_directory_fd: int, source_name: str, destination_directory_fd: int, destination_name: str,
+) -> None:
+    """Linux renameat2(RENAME_NOREPLACE) anchored to already-open directories."""
     if not sys.platform.startswith("linux"):
         raise RuntimeError("atomic no-replace publication requires Linux renameat2")
     libc = ctypes.CDLL(None, use_errno=True)
@@ -898,14 +951,19 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
     renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     renameat2.restype = ctypes.c_int
     result = renameat2(
-        AT_FDCWD, os.fsencode(source), AT_FDCWD, os.fsencode(destination), RENAME_NOREPLACE,
+        source_directory_fd, os.fsencode(source_name), destination_directory_fd,
+        os.fsencode(destination_name), RENAME_NOREPLACE,
     )
     if result == 0:
         return
     failure = ctypes.get_errno()
     if failure == errno.EEXIST:
-        raise FileExistsError(failure, os.strerror(failure), destination)
-    raise OSError(failure, os.strerror(failure), destination)
+        raise FileExistsError(failure, os.strerror(failure), destination_name)
+    raise OSError(failure, os.strerror(failure), destination_name)
+
+
+def _fsync_directory_fd(directory_fd: int) -> None:
+    os.fsync(directory_fd)
 
 
 def _open_regular_file(
@@ -944,8 +1002,7 @@ def _verify_named_identity(
 
 
 def _publish_binary_no_replace(
-    directory_fd: int, directory: Path, partial_name: str, final_name: str,
-    expected_bytes: int, label: str,
+    directory_fd: int, partial_name: str, final_name: str, expected_bytes: int, label: str,
 ) -> tuple[int, FileIdentityTuple]:
     partial_fd, partial_identity = _open_regular_file(
         directory_fd, partial_name, expected_bytes, f"partial {label}"
@@ -954,8 +1011,8 @@ def _publish_binary_no_replace(
     published = False
     try:
         try:
-            _rename_no_replace(directory / partial_name, directory / final_name)
-            _fsync_directory(directory)
+            _rename_no_replace(directory_fd, partial_name, directory_fd, final_name)
+            _fsync_directory_fd(directory_fd)
         except FileExistsError:
             final_fd, final_identity = _open_regular_file(directory_fd, final_name, expected_bytes, label)
             if final_identity != partial_identity:
@@ -977,23 +1034,37 @@ def _publish_binary_no_replace(
 
 
 def _atomic_create_json(
-    directory_fd: int, directory: Path, name: str, payload: Mapping[str, object],
+    directory_fd: int, name: str, payload: Mapping[str, object],
 ) -> tuple[FileIdentityTuple, int]:
     """Atomically rename JSON into place and return its identity and writable fd."""
-    temporary: Path | None = None
+    temporary_name: str | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=directory, prefix=f".{name}.", suffix=".partial", delete=False,
-        ) as stream:
-            temporary = Path(stream.name)
+        for _ in range(128):
+            candidate = f".{name}.{os.getpid()}.{secrets.token_hex(8)}.partial"
+            try:
+                temporary_fd = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        else:  # pragma: no cover - cryptographic name collisions are infeasible
+            raise RuntimeError("could not create unique completion metadata temporary")
+        with os.fdopen(temporary_fd, "w", encoding="utf-8") as stream:
             json.dump(payload, stream, indent=2, sort_keys=True)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
             status = os.fstat(stream.fileno())
             identity = (status.st_dev, status.st_ino, status.st_size)
-        _rename_no_replace(temporary, directory / name)
-        _fsync_directory(directory)
+        _rename_no_replace(directory_fd, temporary_name, directory_fd, name)
+        temporary_name = None
+        _fsync_directory_fd(directory_fd)
         metadata_fd, metadata_identity = _open_regular_file(
             directory_fd, name, identity[2], "completion metadata", writable=True
         )
@@ -1002,8 +1073,11 @@ def _atomic_create_json(
             raise RuntimeError("completion metadata changed during publication")
         return identity, metadata_fd
     except BaseException:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
         raise
 
 
@@ -1107,7 +1181,7 @@ def finalize_outputs(
                 )
             except FileNotFoundError:
                 final_fd, final_identity = _publish_binary_no_replace(
-                    directory_fd, resolved, partial_name, final_name, expected_bytes, label
+                    directory_fd, partial_name, final_name, expected_bytes, label
                 )
             else:
                 try:
@@ -1130,7 +1204,7 @@ def finalize_outputs(
         for _, identity, name, label in held_finals:
             _verify_named_identity(directory_fd, name, identity, label)
         metadata = _final_metadata(run, manifest, merge_state, batch_size, num_workers)
-        metadata_identity, metadata_fd = _atomic_create_json(directory_fd, resolved, "metadata.json", metadata)
+        metadata_identity, metadata_fd = _atomic_create_json(directory_fd, "metadata.json", metadata)
         try:
             for _, identity, name, label in held_finals:
                 _verify_named_identity(directory_fd, name, identity, label)

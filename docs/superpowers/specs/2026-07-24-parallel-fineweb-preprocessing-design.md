@@ -102,8 +102,11 @@ and per-shard statistics needed for final metadata. The merge state records the
 hash of this manifest, so temporary shard sidecars can be removed without
 losing provenance or document counts.
 
-On resume, the parent loads the matching run manifest and merge state before
-scheduling workers. Results with indexes below `merge_state.next_index` are
+On resume, the parent validates the matching run manifest and merge state before
+scheduling workers. A valid manifest with no merge state is the durable
+pre-first-merge window: it atomically establishes a zero merge state, truncates
+any stale partial outputs to zero, and replays/rebuilds uncommitted shards.
+State without a manifest remains a hard error. Results with indexes below `merge_state.next_index` are
 already committed and are not rebuilt even though their temporary files were
 deleted. Only uncommitted indexes are validated and, if necessary, rebuilt;
 their new statistics must match the immutable run manifest before merging

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -232,6 +233,44 @@ class WorkerTests(unittest.TestCase):
             with self.assertRaisesRegex(OverflowError, "int32"):
                 pp.tokenize_file(task)
 
+    def test_tokenize_file_rejects_source_changed_before_read_without_publishing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task = self.make_task(root)
+            pq.write_table(pa.table({"text": ["changed"]}), task.source.path)
+            pp._WORKER_TOKENIZER = FakeTokenizer()
+            with self.assertRaisesRegex(RuntimeError, "source identity changed"):
+                pp.tokenize_file(task)
+            self.assertFalse(Path(task.shard_path).exists())
+            self.assertFalse(Path(task.sidecar_path).exists())
+            self.assertFalse(Path(task.shard_path + ".partial").exists())
+
+    def test_tokenize_file_rejects_source_replaced_during_read_without_publishing(self) -> None:
+        class ReplacingTokenizer(FakeTokenizer):
+            def __init__(self, source: Path, replacement: Path) -> None:
+                self.source = source
+                self.replacement = replacement
+                self.replaced = False
+
+            def encode_batch(self, texts, *, add_bos=False, add_eos=False):
+                encoded = super().encode_batch(texts, add_bos=add_bos, add_eos=add_eos)
+                if not self.replaced:
+                    os.replace(self.replacement, self.source)
+                    self.replaced = True
+                return encoded
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task = self.make_task(root)
+            replacement = root / "replacement.parquet"
+            pq.write_table(pa.table({"text": ["replacement"]}), replacement)
+            pp._WORKER_TOKENIZER = ReplacingTokenizer(Path(task.source.path), replacement)
+            with self.assertRaisesRegex(RuntimeError, "source identity changed"):
+                pp.tokenize_file(task)
+            self.assertFalse(Path(task.shard_path).exists())
+            self.assertFalse(Path(task.sidecar_path).exists())
+            self.assertFalse(Path(task.shard_path + ".partial").exists())
+
 
 class ProgressTests(unittest.TestCase):
     @staticmethod
@@ -360,7 +399,7 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(len(messages), 2)
         self.assertTrue(all("files=" in message for message in messages))
         executor.submit.assert_called_once_with(pp.tokenize_file, task)
-        executor.__enter__.assert_called_once_with()
+        executor.shutdown.assert_called_once_with(wait=True)
         process_pool.assert_called_once_with(
             max_workers=2,
             mp_context="spawn-context",
@@ -412,6 +451,65 @@ class ProgressTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 pp._run_pending_tasks([task], "tokenizer.model", 1, [], 1, 0.0, 0.1, lambda _: None)
         self.assertEqual(raised.exception.code, 3)
+
+    def test_run_pending_tasks_aborts_processes_when_submit_fails(self) -> None:
+        tasks = self.make_tasks(0, 1)
+        submitted = mock.Mock()
+        worker = mock.Mock()
+        worker.is_alive.return_value = True
+        executor = mock.Mock()
+        executor.submit.side_effect = [submitted, OSError("submit failed")]
+        executor._processes = {1: worker}
+        with mock.patch.object(pp, "ProcessPoolExecutor", return_value=executor), mock.patch.object(
+            pp, "get_context", return_value="spawn-context"
+        ):
+            with self.assertRaisesRegex(OSError, "submit failed"):
+                pp._run_pending_tasks(tasks, "tokenizer.model", 2, [], 2, 0.0, 0.1, lambda _: None)
+        submitted.cancel.assert_called_once_with()
+        executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+        worker.terminate.assert_called_once_with()
+        worker.join.assert_called_once_with()
+
+    def test_run_pending_tasks_sigterm_during_wait_cancels_and_terminates_promptly(self) -> None:
+        task = self.make_tasks(0)[0]
+        future = mock.Mock()
+        worker = mock.Mock()
+        worker.is_alive.return_value = True
+        executor = mock.Mock()
+        executor.submit.return_value = future
+        executor._processes = {1: worker}
+
+        def deliver_sigterm(*_args: object, **_kwargs: object) -> tuple[set[object], set[object]]:
+            os.kill(os.getpid(), signal.SIGTERM)
+            raise AssertionError("signal handler did not interrupt wait")
+
+        previous = signal.signal(signal.SIGTERM, pp._interrupt_on_sigterm)
+        try:
+            with mock.patch.object(pp, "ProcessPoolExecutor", return_value=executor), mock.patch.object(
+                pp, "wait", side_effect=deliver_sigterm
+            ), mock.patch.object(pp, "get_context", return_value="spawn-context"):
+                with self.assertRaisesRegex(KeyboardInterrupt, "received signal"):
+                    pp._run_pending_tasks([task], "tokenizer.model", 1, [], 1, 0.0, 0.1, lambda _: None)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        future.cancel.assert_called_once_with()
+        executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+        worker.terminate.assert_called_once_with()
+        worker.join.assert_called_once_with()
+
+    def test_abort_process_pool_keeps_worker_handles_across_shutdown(self) -> None:
+        worker = mock.Mock()
+        worker.is_alive.return_value = True
+        executor = mock.Mock()
+        executor._processes = {1: worker}
+
+        def clear_process_map(*_args: object, **_kwargs: object) -> None:
+            executor._processes = None
+
+        executor.shutdown.side_effect = clear_process_map
+        pp._abort_process_pool(executor, {})
+        worker.terminate.assert_called_once_with()
+        worker.join.assert_called_once_with()
 
 
 class MergeTests(unittest.TestCase):
@@ -488,7 +586,7 @@ class MergeTests(unittest.TestCase):
             self.assertEqual(loaded_manifest.results, tuple(results))
             self.assertEqual(loaded_state.next_index, 1)
 
-    def test_load_resume_context_requires_both_files_and_matching_run(self) -> None:
+    def test_load_resume_context_recovers_manifest_only_but_rejects_state_only_and_wrong_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             state_dir = root / ".preprocess"
@@ -498,9 +596,9 @@ class MergeTests(unittest.TestCase):
                 pp.load_resume_context(state_dir, "run-hash")
             (state_dir / "merge-state.json").unlink()
             manifest = pp.write_run_manifest(state_dir, "run-hash", [])
-            with self.assertRaisesRegex(RuntimeError, "both"):
-                pp.load_resume_context(state_dir, "run-hash")
-            pp.atomic_write_json(state_dir / "merge-state.json", self.state_payload(manifest))
+            loaded_manifest, loaded_state = pp.load_resume_context(state_dir, "run-hash")
+            self.assertEqual(loaded_manifest, manifest)
+            self.assertEqual(loaded_state, pp.MergeState(manifest.sha256, 0, 0, 0, 0, 0, 0))
             with self.assertRaisesRegex(RuntimeError, "run hash"):
                 pp.load_resume_context(state_dir, "other-run")
 
@@ -592,15 +690,15 @@ class MergeTests(unittest.TestCase):
             self.assertEqual(state.tokens, 0)
             self.assertFalse(Path(result.shard_path).exists())
 
-    def test_merge_resume_requires_an_existing_journal(self) -> None:
+    def test_merge_resume_recovers_manifest_only_by_replaying_from_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             result = self.write_result(root, 0, [1])
             manifest = pp.write_run_manifest(root / ".preprocess", "run-hash", [result])
-            with self.assertRaisesRegex(RuntimeError, "merge-state.json"):
-                pp.merge_shards([result], root, 1, manifest, resume=True)
-            self.assertTrue(Path(result.shard_path).exists())
-            self.assertFalse((root / "val.bin.partial").exists())
+            np.asarray([99], dtype="<i4").tofile(root / "val.bin.partial")
+            state = pp.merge_shards([result], root, 1, manifest, resume=True)
+            self.assertEqual(state.next_index, 1)
+            self.assertEqual(np.fromfile(root / "val.bin.partial", dtype="<i4").tolist(), [1])
 
     def test_fresh_merge_refuses_an_existing_journal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -886,8 +984,12 @@ class FinalizationTests(unittest.TestCase):
             destination = root / "destination"
             source.write_bytes(b"source")
             destination.write_bytes(b"destination")
-            with self.assertRaises(FileExistsError):
-                pp._rename_no_replace(source, destination)
+            directory_fd = pp._open_output_directory(root)
+            try:
+                with self.assertRaises(FileExistsError):
+                    pp._rename_no_replace(directory_fd, source.name, directory_fd, destination.name)
+            finally:
+                os.close(directory_fd)
             self.assertEqual(source.read_bytes(), b"source")
             self.assertEqual(destination.read_bytes(), b"destination")
 
@@ -921,11 +1023,11 @@ class FinalizationTests(unittest.TestCase):
             np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
             original_rename = pp._rename_no_replace
 
-            def race(source: Path, destination: Path) -> None:
-                destination_path = root / destination.name
-                if destination_path.name == "val.bin":
+            def race(source_fd: int, source: str, destination_fd: int, destination: str) -> None:
+                if destination == "val.bin":
+                    destination_path = root / destination
                     np.asarray([99, 100], dtype="<i4").tofile(destination_path)
-                original_rename(source, destination)
+                original_rename(source_fd, source, destination_fd, destination)
 
             with mock.patch.object(pp, "_rename_no_replace", race):
                 with self.assertRaisesRegex(RuntimeError, "destination"):
@@ -940,11 +1042,11 @@ class FinalizationTests(unittest.TestCase):
             np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
             original_rename = pp._rename_no_replace
 
-            def race(source: Path, destination: Path) -> None:
-                destination_path = root / destination.name
-                if destination_path.name == "metadata.json":
+            def race(source_fd: int, source: str, destination_fd: int, destination: str) -> None:
+                destination_path = root / destination
+                if destination == "metadata.json":
                     destination_path.write_text('{"race":true}', encoding="utf-8")
-                original_rename(source, destination)
+                original_rename(source_fd, source, destination_fd, destination)
 
             with mock.patch.object(pp, "_rename_no_replace", race):
                 with self.assertRaisesRegex(FileExistsError, "metadata.json"):
@@ -960,11 +1062,11 @@ class FinalizationTests(unittest.TestCase):
             np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
             original_rename = pp._rename_no_replace
 
-            def swap_then_link(source: Path, destination: Path) -> None:
-                if destination.name == "val.bin":
+            def swap_then_link(source_fd: int, source: str, destination_fd: int, destination: str) -> None:
+                if destination == "val.bin":
                     partial.unlink()
                     np.asarray([90, 91], dtype="<i4").tofile(partial)
-                original_rename(source, destination)
+                original_rename(source_fd, source, destination_fd, destination)
 
             with mock.patch.object(pp, "_rename_no_replace", swap_then_link):
                 with self.assertRaisesRegex(RuntimeError, "inode"):
@@ -1036,11 +1138,11 @@ class FinalizationTests(unittest.TestCase):
             np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
             original_rename = pp._rename_no_replace
 
-            def symlink_then_link(source: Path, destination: Path) -> None:
-                if destination.name == "val.bin":
+            def symlink_then_link(source_fd: int, source: str, destination_fd: int, destination: str) -> None:
+                if destination == "val.bin":
                     partial.unlink()
                     partial.symlink_to(outside)
-                original_rename(source, destination)
+                original_rename(source_fd, source, destination_fd, destination)
 
             with mock.patch.object(pp, "_rename_no_replace", symlink_then_link):
                 with self.assertRaises(OSError):
@@ -1062,6 +1164,35 @@ class FinalizationTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     pp.finalize_outputs(root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2)
             self.assertEqual((root / "metadata.json").read_text(encoding="utf-8"), '{"incomplete":true}\n')
+
+    def test_finalize_keeps_publication_bound_to_open_directory_after_path_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "output"
+            root.mkdir()
+            outside = parent / "outside"
+            outside.mkdir()
+            np.asarray([1, 2], dtype="<i4").tofile(root / "val.bin.partial")
+            np.asarray([3], dtype="<i4").tofile(root / "train.bin.partial")
+            original_open = pp._open_output_directory
+            original_root = parent / "output.original"
+            swapped = False
+
+            def open_then_swap(path: Path) -> int:
+                nonlocal swapped
+                descriptor = original_open(path)
+                if not swapped:
+                    root.rename(original_root)
+                    root.symlink_to(outside, target_is_directory=True)
+                    swapped = True
+                return descriptor
+
+            with mock.patch.object(pp, "_open_output_directory", side_effect=open_then_swap):
+                metadata = pp.finalize_outputs(
+                    root, self.run_identity(), self.manifest(), self.state(), 2, 1, 2
+                )
+            self.assertEqual(json.loads((original_root / "metadata.json").read_text()), metadata)
+            self.assertFalse(any(outside.iterdir()))
 
     def test_finalize_rejects_insufficient_validation_or_training_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1278,6 +1409,40 @@ class MainTests(unittest.TestCase):
             ):
                 self.assertEqual(pp.main([]), 0)
                 self.assertIs(merge.call_args.args[4], expected_resume)
+
+    def test_main_recovers_manifest_publication_window_and_rebuilds_missing_shard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            for index, text in enumerate(("alpha beta", "gamma delta")):
+                pq.write_table(pa.table({"text": [text]}), inputs / f"{index}.parquet")
+            tokenizer = Path(pp.__file__).resolve().parents[1] / "tokenizer" / "tokenizer.model"
+            output = pp.prepare_output(root / "output", overwrite=False, resume=True)
+            sources = pp.discover_inputs(str(inputs / "*.parquet"), max_files=None)
+            run = pp.build_run_identity(sources, tokenizer, pp.EXPECTED_VOCAB_SIZE, "text", False, True)
+            tasks = pp.make_worker_tasks(run, output / ".preprocess", batch_size=1)
+            previous_tokenizer = pp._WORKER_TOKENIZER
+            try:
+                pp._WORKER_TOKENIZER = pp.SentencePieceTokenizer(tokenizer)
+                results = [pp.tokenize_file(task) for task in tasks]
+            finally:
+                pp._WORKER_TOKENIZER = previous_tokenizer
+            pp.write_run_manifest(output / ".preprocess", run.digest(), results)
+            Path(results[0].shard_path).unlink()
+            Path(results[0].sidecar_path).unlink()
+            np.asarray([999], dtype="<i4").tofile(output / "val.bin.partial")
+            np.asarray([999], dtype="<i4").tofile(output / "train.bin.partial")
+            exit_code = pp.main([
+                "--input-glob", str(inputs / "*.parquet"), "--tokenizer", str(tokenizer),
+                "--output-dir", str(output), "--num-workers", "1", "--batch-size", "1",
+                "--validation-tokens", "1", "--add-eos", "--resume",
+            ])
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((output / ".preprocess" / "merge-state.json").is_file())
+            self.assertTrue((output / "metadata.json").is_file())
+            self.assertNotIn(999, np.fromfile(output / "val.bin", dtype="<i4").tolist())
+            self.assertNotIn(999, np.fromfile(output / "train.bin", dtype="<i4").tolist())
 
     def test_sigterm_handler_only_interrupts(self) -> None:
         with self.assertRaisesRegex(KeyboardInterrupt, "received signal 15"):

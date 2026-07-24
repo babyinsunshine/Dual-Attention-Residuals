@@ -665,9 +665,10 @@ writes `run-manifest.json` atomically, and returns `RunManifest`. If a manifest
 already exists, require identical canonical content instead of silently
 replacing a different run.
 
-`load_resume_context` returns `None` when neither state file exists. It is a hard
-error when exactly one exists, when the stored run hash differs, when the merge
-manifest hash differs, or when `next_index` is outside
+`load_resume_context` returns `None` when neither state file exists. A valid
+manifest without state atomically establishes the zero merge state; state without
+a manifest is a hard error. It is also a hard error when the stored run hash
+differs, when the merge manifest hash differs, or when `next_index` is outside
 `0..len(manifest.results)`. This function is called before worker scheduling so
 already committed and deleted shards are never rebuilt.
 
@@ -927,7 +928,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 `print_disk_status` uses `shutil.disk_usage`, prints free GiB, and warns on
 stderr below 450 GiB only for a full run. In `__main__`, temporarily map
 `SIGTERM` to a handler that raises `KeyboardInterrupt`, restore the previous
-handler in `finally`, and let the executor context cancel pending futures. The
+handler in `finally`. On `BaseException`, orchestration cancels futures,
+requests non-waiting executor shutdown, and terminates spawned workers via the
+contained Python-3.10 process-map compatibility helper before joining. The
 handler must not delete files; atomic files and the journal provide recovery:
 
 ```python
