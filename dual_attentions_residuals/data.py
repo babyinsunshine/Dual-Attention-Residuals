@@ -5,10 +5,10 @@ import math
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import IterableDataset
 
 
-class PackedTokenDataset(Dataset):
+class PackedTokenDataset(IterableDataset):
     def __init__(
         self,
         path: str | Path,
