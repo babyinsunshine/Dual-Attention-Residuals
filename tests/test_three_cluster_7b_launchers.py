@@ -49,42 +49,96 @@ class ThreeClusterLauncherTests(unittest.TestCase):
         val_tokens.touch()
 
         python_bin = root / "python"
-        python_bin.write_text("#!/usr/bin/env bash\nexit 0\n")
+        python_bin.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+if [[ $* == *'import site; print'* ]]; then
+  echo /tmp/fake-site-packages
+elif [[ $* == *'from pathlib import Path; import torch'* ]]; then
+  echo /tmp/fake-torch/lib
+elif [[ ${1:-} == -m && ${2:-} == torch.distributed.run ]]; then
+  if [[ -n ${FAKE_PYTHON_LOG:-} ]]; then
+    printf 'launch\\t%s\\t%s\\t%s\\n' \
+      "${MEGATRON_LR_WARMUP_ITERS:-missing}" \
+      "${MEGATRON_LR_DECAY_ITERS:-missing}" "$*" >> "$FAKE_PYTHON_LOG"
+  fi
+  sleep 0.3
+fi
+exit 0
+"""
+        )
         python_bin.chmod(0o755)
 
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        fake_nvidia_smi = fake_bin / "nvidia-smi"
+        fake_nvidia_smi.write_text(
+            "#!/usr/bin/env bash\nprintf '%s\\n' 0 1 2 3 4 5 6 7\n"
+        )
+        fake_nvidia_smi.chmod(0o755)
+
         fake_ssh_calls = root / "ssh-calls.log"
+        fake_ssh_pids = root / "ssh-pids.log"
         fake_ssh = root / "fake-ssh"
         fake_ssh.write_text(
             """#!/usr/bin/env bash
 set -euo pipefail
-cat >/dev/null
+remote_script=$(mktemp)
+trap 'rm -f "$remote_script"' EXIT
+cat > "$remote_script"
 args=("$@")
+host=
+host_index=-1
+for ((i=0; i<${#args[@]}; i++)); do
+  if [[ ${args[$i]} == root@* ]]; then
+    host=${args[$i]#root@}
+    host_index=$i
+  fi
+done
+(( host_index >= 0 )) || { echo "missing remote host" >&2; exit 2; }
+remote_command=
+for ((i=host_index + 1; i<${#args[@]}; i++)); do
+  [[ -z $remote_command ]] || remote_command+=' '
+  remote_command+=${args[$i]}
+done
+if [[ ${FAKE_SSH_EXEC_REMOTE:-0} == 1 ]]; then
+  bash -c "$remote_command" < "$remote_script"
+  exit $?
+fi
+eval "set -- $remote_command"
+parsed=("$@")
 mode=
 mode_index=-1
-host=
-for ((i=0; i<${#args[@]}; i++)); do
-  [[ ${args[$i]} == root@* ]] && host=${args[$i]#root@}
-  if [[ ${args[$i]} == preflight || ${args[$i]} == launch ]]; then
-    mode=${args[$i]}
+for ((i=0; i<${#parsed[@]}; i++)); do
+  if [[ ${parsed[$i]} == preflight || ${parsed[$i]} == launch ]]; then
+    mode=${parsed[$i]}
     mode_index=$i
   fi
 done
 [[ -n $mode ]] || { echo "missing remote mode" >&2; exit 2; }
 if [[ $mode == preflight ]]; then
-  printf 'preflight\\t%s\\n' "$host" >> "$FAKE_SSH_CALLS"
+  printf 'preflight\\t%s\\t%s\\t%s\\t%s\\n' "$host" \
+    "${parsed[$((mode_index + 4))]}" "${parsed[$((mode_index + 5))]}" \
+    "${parsed[$((mode_index + 6))]}" >> "$FAKE_SSH_CALLS"
   [[ ${FAKE_SSH_FAIL_PREFLIGHT_HOST:-} != "$host" ]] || exit 23
   exit 0
 fi
-model=${args[$((mode_index + 8))]}
-rank=${args[$((mode_index + 9))]}
-master=${args[$((mode_index + 11))]}
+model=${parsed[$((mode_index + 8))]}
+rank=${parsed[$((mode_index + 9))]}
+master=${parsed[$((mode_index + 11))]}
 printf 'launch\\t%s\\t%s\\t%s\\t%s\\n' "$host" "$rank" "$master" "$model" >> "$FAKE_SSH_CALLS"
+printf '%s\\n' "$$" >> "$FAKE_SSH_PIDS"
 printf 'fake ssh launched model=%s rank=%s host=%s\\n' "$model" "$rank" "$host"
+[[ ${FAKE_SSH_FAIL_LAUNCH_RANK:-} != "$rank" ]] || exit 23
+if [[ ${FAKE_SSH_DELAYED_FAIL_LAUNCH_RANK:-} == "$rank" ]]; then
+  sleep 0.6
+  exit 23
+fi
 if [[ ${FAKE_SSH_BLOCK:-0} == 1 ]]; then
   trap 'exit 0' TERM INT
   while :; do sleep 0.05; done
 fi
-sleep 0.3
+sleep 0.8
 """
         )
         fake_ssh.chmod(0o755)
@@ -95,6 +149,7 @@ sleep 0.3
         env = os.environ.copy()
         env.update(
             {
+                "PATH": f"{fake_bin}:{env['PATH']}",
                 "HOSTFILE": str(hostfile),
                 "PYTHON_BIN": str(python_bin),
                 "TRAIN_TOKENS_FILE": str(train_tokens),
@@ -106,6 +161,7 @@ sleep 0.3
                 "SSH_CONNECT_TIMEOUT": "1",
                 "STARTUP_TIMEOUT": "5",
                 "FAKE_SSH_CALLS": str(fake_ssh_calls),
+                "FAKE_SSH_PIDS": str(fake_ssh_pids),
             }
         )
         return env, hostfile, fake_ssh_calls, log_dir, pid_file
@@ -147,6 +203,42 @@ sleep 0.3
                     f"status did not report {expected}: "
                     f"stdout={completed.stdout!r} stderr={completed.stderr!r}"
                 )
+            time.sleep(0.05)
+
+    def poll_recorded_pids(
+        self, env: dict[str, str], expected: int = 4, timeout: float = 5
+    ) -> list[int]:
+        pid_log = Path(env["FAKE_SSH_PIDS"])
+        deadline = time.monotonic() + timeout
+        while True:
+            if pid_log.exists():
+                pids = [int(line) for line in pid_log.read_text().splitlines()]
+                if len(pids) >= expected:
+                    return pids
+            if time.monotonic() >= deadline:
+                self.fail(f"fake SSH did not record {expected} launch PIDs")
+            time.sleep(0.05)
+
+    def process_exists(self, pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        stat = Path(f"/proc/{pid}/stat")
+        if stat.is_file() and stat.read_text().split()[2] == "Z":
+            return False
+        return True
+
+    def stop_test_processes(self, pids: list[int]) -> None:
+        for pid in pids:
+            try:
+                os.kill(pid, 15)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and any(
+            self.process_exists(pid) for pid in pids
+        ):
             time.sleep(0.05)
 
     def test_each_entry_dry_run_reports_literal_model_contract(self) -> None:
@@ -350,6 +442,13 @@ sleep 0.3
             launches = [line.split("\t") for line in calls if line.startswith("launch\t")]
             self.assertEqual(len(preflights), 4)
             self.assertEqual(len(launches), 4)
+            preflight_indexes = [
+                index for index, line in enumerate(calls) if line.startswith("preflight\t")
+            ]
+            launch_indexes = [
+                index for index, line in enumerate(calls) if line.startswith("launch\t")
+            ]
+            self.assertLess(max(preflight_indexes), min(launch_indexes))
             node_ranks = sorted(call[2] for call in launches)
             self.assertEqual(node_ranks, ["0", "1", "2", "3"])
             self.assertEqual([call[3] for call in launches], ["10.0.0.1"] * 4)
@@ -382,18 +481,25 @@ sleep 0.3
             env["FAKE_SSH_BLOCK"] = "1"
             entry = "train_7b_attnres_4node.sh"
 
-            started = self.run_entry(entry, env, "start")
-            self.assertEqual(started.returncode, 0, started.stderr)
-            running = self.poll_status(entry, env, "RUNNING")
-            self.assertEqual(running.returncode, 0, running.stderr)
-            controller_pid = int(pid_file.read_text().strip())
+            ssh_pids: list[int] = []
+            try:
+                started = self.run_entry(entry, env, "start")
+                self.assertEqual(started.returncode, 0, started.stderr)
+                running = self.poll_status(entry, env, "RUNNING")
+                self.assertEqual(running.returncode, 0, running.stderr)
+                controller_pid = int(pid_file.read_text().strip())
+                ssh_pids = self.poll_recorded_pids(env)
 
-            stopped = self.run_entry(entry, env, "stop", timeout=35)
+                stopped = self.run_entry(entry, env, "stop", timeout=35)
 
-            self.assertEqual(stopped.returncode, 0, stopped.stderr)
-            self.poll_status(entry, env, "STOPPED")
-            with self.assertRaises(ProcessLookupError):
-                os.kill(controller_pid, 0)
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+                self.poll_status(entry, env, "STOPPED")
+                self.assertFalse(self.process_exists(controller_pid))
+                self.assertEqual(
+                    [pid for pid in ssh_pids if self.process_exists(pid)], []
+                )
+            finally:
+                self.stop_test_processes(ssh_pids)
 
     def test_stale_pid_reports_stopped_and_does_not_block_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -414,6 +520,152 @@ sleep 0.3
             self.poll_status(entry, env, "RUNNING")
             stopped = self.run_entry(entry, env, "stop", timeout=35)
             self.assertEqual(stopped.returncode, 0, stopped.stderr)
+
+    def test_reused_live_pid_is_not_owned_or_signaled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _hostfile, _fake_calls, _log_dir, pid_file = self.make_runtime(
+                Path(tmp)
+            )
+            unrelated = subprocess.Popen(["setsid", "sleep", "30"])
+            try:
+                pid_file.parent.mkdir(parents=True)
+                pid_file.write_text(f"{unrelated.pid}\n")
+                Path(f"{pid_file}.owner").write_text("stale-owner-token\n")
+
+                status = self.run_entry("train_7b_baseline_4node.sh", env, "status")
+                stopped = self.run_entry("train_7b_baseline_4node.sh", env, "stop")
+
+                self.assertEqual(status.returncode, 1)
+                self.assertIn("STOPPED", status.stdout)
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+                self.assertIsNone(unrelated.poll())
+            finally:
+                if unrelated.poll() is None:
+                    unrelated.terminate()
+                unrelated.wait(timeout=5)
+
+    def test_quick_launch_failure_never_reports_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _hostfile, _fake_calls, _log_dir, pid_file = self.make_runtime(
+                Path(tmp)
+            )
+            env["FAKE_SSH_BLOCK"] = "1"
+            env["FAKE_SSH_FAIL_LAUNCH_RANK"] = "2"
+            ssh_pids: list[int] = []
+            try:
+                started = self.run_entry(
+                    "train_7b_baseline_4node.sh", env, "start", timeout=10
+                )
+                if Path(env["FAKE_SSH_PIDS"]).exists():
+                    ssh_pids = [
+                        int(line)
+                        for line in Path(env["FAKE_SSH_PIDS"]).read_text().splitlines()
+                    ]
+
+                controller_log = Path(env["LOG_DIR"]) / "baseline_controller.log"
+                diagnostic = (
+                    controller_log.read_text() if controller_log.exists() else "missing log"
+                )
+                self.assertNotEqual(started.returncode, 0, diagnostic)
+                self.assertIn(
+                    "node rank 2 (10.0.0.3) exited during startup", diagnostic
+                )
+                self.assertFalse(Path(f"{pid_file}.ready").exists())
+                status = self.run_entry("train_7b_baseline_4node.sh", env, "status")
+                self.assertEqual(status.returncode, 1)
+                self.assertIn("STOPPED", status.stdout)
+            finally:
+                self.stop_test_processes(ssh_pids)
+
+    def test_remote_arguments_survive_login_shell_serialization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, _hostfile, fake_calls, _log_dir, _pid_file = self.make_runtime(
+                root
+            )
+            injected = root / "remote-command-injected"
+            master = f"10.0.0.1;touch {injected};#"
+            env["MASTER_ADDR"] = master
+
+            completed = self.run_entry(
+                "train_7b_baseline_4node.sh", env, "__controller"
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse(injected.exists())
+            launches = [
+                line.split("\t")
+                for line in fake_calls.read_text().splitlines()
+                if line.startswith("launch\t")
+            ]
+            self.assertEqual([call[3] for call in launches], [master] * 4)
+
+    def test_smoke_overrides_reach_remote_scheduler_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, _hostfile, _fake_calls, _log_dir, _pid_file = self.make_runtime(
+                root
+            )
+            python_log = root / "python-launches.log"
+            env.update(
+                {
+                    "FAKE_SSH_EXEC_REMOTE": "1",
+                    "FAKE_PYTHON_LOG": str(python_log),
+                    "TRAIN_ITERS": "1",
+                    "WARMUP_ITERS": "0",
+                }
+            )
+
+            completed = self.run_entry(
+                "train_7b_baseline_4node.sh", env, "__controller"
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            launches = [line.split("\t") for line in python_log.read_text().splitlines()]
+            self.assertEqual(len(launches), 4)
+            self.assertEqual([line[1] for line in launches], ["0"] * 4)
+            self.assertEqual([line[2] for line in launches], ["1"] * 4)
+
+    def test_pid_override_parent_is_created_before_controller_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, _hostfile, _fake_calls, _log_dir, _pid_file = self.make_runtime(
+                root
+            )
+            pid_file = root / "nested" / "controller-state" / "controller.pid"
+            env["PID_FILE"] = str(pid_file)
+            env["FAKE_SSH_BLOCK"] = "1"
+            ssh_pids: list[int] = []
+            try:
+                started = self.run_entry("train_7b_baseline_4node.sh", env, "start")
+                if Path(env["FAKE_SSH_PIDS"]).exists():
+                    ssh_pids = [
+                        int(line)
+                        for line in Path(env["FAKE_SSH_PIDS"]).read_text().splitlines()
+                    ]
+
+                self.assertEqual(started.returncode, 0, started.stderr)
+                self.assertTrue(pid_file.is_file())
+                stopped = self.run_entry(
+                    "train_7b_baseline_4node.sh", env, "stop", timeout=35
+                )
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+            finally:
+                self.stop_test_processes(ssh_pids)
+
+    def test_failed_launch_reports_rank_and_host(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _hostfile, _fake_calls, _log_dir, _pid_file = self.make_runtime(
+                Path(tmp)
+            )
+            env["FAKE_SSH_DELAYED_FAIL_LAUNCH_RANK"] = "2"
+
+            completed = self.run_entry(
+                "train_7b_baseline_4node.sh", env, "__controller"
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("node rank 2 (10.0.0.3): FAILED", completed.stdout)
 
 
 if __name__ == "__main__":

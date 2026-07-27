@@ -40,6 +40,14 @@ read_pid() {
   printf '%s\n' "$pid"
 }
 
+read_owner() {
+  [[ -f $OWNER_FILE ]] || return 1
+  local owner extra
+  read -r owner extra < "$OWNER_FILE" || return 1
+  [[ $owner =~ ^[a-zA-Z0-9._-]+$ && -z ${extra:-} ]] || return 1
+  printf '%s\n' "$owner"
+}
+
 write_atomic() {
   local destination=$1
   local value=$2
@@ -57,6 +65,33 @@ remove_marker_if_owned() {
   [[ $recorded == "$owner" ]] && rm -f "$path"
 }
 
+controller_is_owned() {
+  local pid=$1
+  local owner=$2
+  pid_is_running "$pid" || return 1
+  [[ -r /proc/$pid/stat && -r /proc/$pid/cmdline ]] || return 1
+
+  local process_group session
+  read -r process_group session < <(awk '{print $5, $6}' "/proc/$pid/stat") || return 1
+  [[ $process_group == "$pid" && $session == "$pid" ]] || return 1
+
+  local argument saw_script=0 saw_action=0 saw_owner=0
+  while IFS= read -r -d '' argument; do
+    [[ $argument == "$ROOT/scripts/launch_7b_ssh_common.sh" ]] && saw_script=1
+    [[ $argument == __controller ]] && saw_action=1
+    [[ $argument == "$owner" ]] && saw_owner=1
+  done < "/proc/$pid/cmdline"
+  (( saw_script && saw_action && saw_owner ))
+}
+
+remove_controller_state() {
+  local pid=$1
+  local owner=$2
+  remove_marker_if_owned "$PID_FILE" "$pid"
+  remove_marker_if_owned "$READY_FILE" "$owner"
+  remove_marker_if_owned "$OWNER_FILE" "$owner"
+}
+
 : "${MODEL_NAME:?entry script must set MODEL_NAME}"
 : "${HOSTFILE:?entry script must set HOSTFILE}"
 : "${MODEL_LAUNCHER:?entry script must set MODEL_LAUNCHER}"
@@ -72,6 +107,7 @@ OUTPUT_DIR=$(absolute_path "$OUTPUT_DIR")
 LOG_DIR=$(absolute_path "$LOG_DIR")
 PID_FILE=$(absolute_path "$PID_FILE")
 READY_FILE="${PID_FILE}.ready"
+OWNER_FILE="${PID_FILE}.owner"
 CONTROLLER_LOG="$LOG_DIR/${MODEL_NAME}_controller.log"
 
 MASTER_PORT=${MASTER_PORT:-29500}
@@ -158,6 +194,7 @@ print_contract() {
   echo "OUTPUT_DIR=$OUTPUT_DIR"
   echo "LOG_DIR=$LOG_DIR"
   echo "PID_FILE=$PID_FILE"
+  echo "OWNER_FILE=$OWNER_FILE"
   echo "CONTROLLER_LOG=$CONTROLLER_LOG"
   echo "TRAIN_ITERS=$TRAIN_ITERS"
   echo "MICRO_BATCH_SIZE=$MICRO_BATCH_SIZE"
@@ -243,8 +280,8 @@ export NCCL_DEBUG=${NCCL_DEBUG:-INFO}
 export NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-INIT,NET}
 export MEGATRON_FORCE_UNIFORM_MOE_ROUTING=0
 export MEGATRON_ENABLE_LR_SCHEDULER=1
-export MEGATRON_LR_WARMUP_ITERS=2000
-export MEGATRON_LR_DECAY_ITERS=40000
+export MEGATRON_LR_WARMUP_ITERS="$warmup_iters"
+export MEGATRON_LR_DECAY_ITERS="$train_iters"
 export MEGATRON_LR_DECAY_STYLE=cosine
 export MEGATRON_LR_WARMUP_INIT_LR=0
 
@@ -271,16 +308,29 @@ exec env \
 REMOTE
 )
 
+remote_command() {
+  local command argument quoted
+  command='bash -s --'
+  for argument in "$@"; do
+    printf -v quoted '%q' "$argument"
+    command+=" $quoted"
+  done
+  printf '%s\n' "$command"
+}
+
 run_remote() {
   local host=$1
   shift
-  printf '%s\n' "$REMOTE_SCRIPT" | "$SSH_BIN" \
+  local command
+  command=$(remote_command "$@")
+  "$SSH_BIN" \
     -o BatchMode=yes \
     -o "ConnectTimeout=$SSH_CONNECT_TIMEOUT" \
-    "root@$host" bash -s -- "$@"
+    "root@$host" "$command" <<< "$REMOTE_SCRIPT"
 }
 
 declare -a ACTIVE_PIDS=()
+CONTROLLER_OWNER=
 
 controller_cleanup() {
   local pid
@@ -291,7 +341,7 @@ controller_cleanup() {
   for pid in "${ACTIVE_PIDS[@]}"; do
     wait "$pid" 2>/dev/null || true
   done
-  remove_marker_if_owned "$READY_FILE" "$$"
+  remove_marker_if_owned "$READY_FILE" "$CONTROLLER_OWNER"
 }
 
 run_controller() {
@@ -313,30 +363,38 @@ run_controller() {
   for rank in "${!HOSTS[@]}"; do
     host=${HOSTS[$rank]}
     local node_log="$LOG_DIR/${MODEL_NAME}_node${rank}.log"
-    echo "starting node rank $rank on $host; log=$node_log"
-    run_remote "$host" launch "$ROOT" "$PYTHON_BIN" "$MODEL_LAUNCHER" \
+    local command
+    command=$(remote_command launch "$ROOT" "$PYTHON_BIN" "$MODEL_LAUNCHER" \
       "$CONFIG_FILE" "$TRAIN_TOKENS_FILE" "$VAL_TOKENS_FILE" "$OUTPUT_DIR" \
       "$MODEL_NAME" "$rank" 4 "$MASTER_ADDR" "$MASTER_PORT" "$GPUS_PER_NODE" \
       "$TRAIN_ITERS" "$MICRO_BATCH_SIZE" "$GLOBAL_BATCH_SIZE" "$WARMUP_ITERS" \
-      "$SAVE_INTERVAL" "$EVAL_INTERVAL" "$EVAL_ITERS" > "$node_log" 2>&1 &
+      "$SAVE_INTERVAL" "$EVAL_INTERVAL" "$EVAL_ITERS")
+    echo "starting node rank $rank on $host; log=$node_log"
+    "$SSH_BIN" \
+      -o BatchMode=yes \
+      -o "ConnectTimeout=$SSH_CONNECT_TIMEOUT" \
+      "root@$host" "$command" <<< "$REMOTE_SCRIPT" > "$node_log" 2>&1 &
     ACTIVE_PIDS[$rank]=$!
   done
 
-  sleep 0.1
-  for rank in "${!ACTIVE_PIDS[@]}"; do
-    kill -0 "${ACTIVE_PIDS[$rank]}" 2>/dev/null || {
-      echo "node rank $rank exited during startup" >&2
-      return 1
-    }
+  local startup_probe
+  for ((startup_probe=0; startup_probe<5; startup_probe++)); do
+    sleep 0.1
+    for rank in "${!ACTIVE_PIDS[@]}"; do
+      pid_is_running "${ACTIVE_PIDS[$rank]}" || {
+        echo "node rank $rank (${HOSTS[$rank]}) exited during startup" >&2
+        return 1
+      }
+    done
   done
-  write_atomic "$READY_FILE" "$$"
+  write_atomic "$READY_FILE" "$CONTROLLER_OWNER"
 
   local failed=0
   for rank in "${!ACTIVE_PIDS[@]}"; do
     if wait "${ACTIVE_PIDS[$rank]}"; then
       echo "node rank $rank: OK"
     else
-      echo "node rank $rank: FAILED"
+      echo "node rank $rank (${HOSTS[$rank]}): FAILED"
       failed=1
     fi
   done
@@ -346,23 +404,32 @@ run_controller() {
 }
 
 start_controller() {
-  local existing_pid=
-  if existing_pid=$(read_pid); then
-    if pid_is_running "$existing_pid"; then
+  command -v setsid >/dev/null || die "setsid is required to supervise the controller"
+  mkdir -p "$LOG_DIR" "$(dirname "$PID_FILE")"
+
+  local existing_pid= existing_owner=
+  existing_pid=$(read_pid 2>/dev/null) || true
+  existing_owner=$(read_owner 2>/dev/null) || true
+  if [[ -n $existing_pid ]]; then
+    if [[ -n $existing_owner ]] && controller_is_owned "$existing_pid" "$existing_owner"; then
       die "$MODEL_NAME controller already running with PID $existing_pid"
     fi
-    remove_marker_if_owned "$READY_FILE" "$existing_pid"
-    rm -f "$PID_FILE"
-  elif [[ -e $PID_FILE ]]; then
-    rm -f "$PID_FILE" "$READY_FILE"
+    remove_marker_if_owned "$PID_FILE" "$existing_pid"
   fi
-  rm -f "$READY_FILE"
+  [[ -z $existing_owner ]] || {
+    remove_marker_if_owned "$READY_FILE" "$existing_owner"
+    remove_marker_if_owned "$OWNER_FILE" "$existing_owner"
+  }
+  [[ ! -e $PID_FILE ]] || rm -f "$PID_FILE"
+  [[ ! -e $READY_FILE ]] || rm -f "$READY_FILE"
+  [[ ! -e $OWNER_FILE ]] || rm -f "$OWNER_FILE"
 
   validate_configuration
   print_contract
-  mkdir -p "$LOG_DIR"
 
-  nohup "$0" __controller > "$CONTROLLER_LOG" 2>&1 < /dev/null &
+  local owner="${MODEL_NAME}.$$.$RANDOM.$RANDOM"
+  write_atomic "$OWNER_FILE" "$owner"
+  nohup setsid "$0" __controller "$owner" > "$CONTROLLER_LOG" 2>&1 < /dev/null &
   local controller_pid=$!
   write_atomic "$PID_FILE" "$controller_pid"
 
@@ -371,32 +438,34 @@ start_controller() {
   for ((attempt=0; attempt<attempts; attempt++)); do
     if [[ -f $READY_FILE ]]; then
       read -r ready_owner < "$READY_FILE" || true
-      if [[ $ready_owner == "$controller_pid" ]] && pid_is_running "$controller_pid"; then
+      if [[ $ready_owner == "$owner" ]] && controller_is_owned "$controller_pid" "$owner"; then
         echo "$MODEL_NAME controller RUNNING with PID $controller_pid"
         return 0
       fi
     fi
     if ! pid_is_running "$controller_pid"; then
       wait "$controller_pid" 2>/dev/null || true
-      remove_marker_if_owned "$PID_FILE" "$controller_pid"
-      remove_marker_if_owned "$READY_FILE" "$controller_pid"
+      remove_controller_state "$controller_pid" "$owner"
       echo "$MODEL_NAME controller failed during startup; see $CONTROLLER_LOG" >&2
       return 1
     fi
     sleep 0.1
   done
 
-  kill -TERM "$controller_pid" 2>/dev/null || true
+  if controller_is_owned "$controller_pid" "$owner"; then
+    kill -TERM -- "-$controller_pid" 2>/dev/null || true
+  fi
   wait "$controller_pid" 2>/dev/null || true
-  remove_marker_if_owned "$PID_FILE" "$controller_pid"
-  remove_marker_if_owned "$READY_FILE" "$controller_pid"
+  remove_controller_state "$controller_pid" "$owner"
   echo "$MODEL_NAME controller did not become ready within ${STARTUP_TIMEOUT}s" >&2
   return 1
 }
 
 show_status() {
-  local pid=
-  if pid=$(read_pid) && pid_is_running "$pid"; then
+  local pid= owner=
+  pid=$(read_pid 2>/dev/null) || true
+  owner=$(read_owner 2>/dev/null) || true
+  if [[ -n $pid && -n $owner ]] && controller_is_owned "$pid" "$owner"; then
     echo "$MODEL_NAME controller RUNNING with PID $pid"
     return 0
   fi
@@ -410,25 +479,29 @@ follow_logs() {
 }
 
 stop_controller() {
-  local pid=
-  if ! pid=$(read_pid); then
+  local pid= owner=
+  pid=$(read_pid 2>/dev/null) || true
+  owner=$(read_owner 2>/dev/null) || true
+  if [[ -z $pid || -z $owner ]]; then
     echo "$MODEL_NAME controller STOPPED"
-    rm -f "$PID_FILE" "$READY_FILE"
+    [[ -z $pid ]] || remove_marker_if_owned "$PID_FILE" "$pid"
+    [[ -z $owner ]] || {
+      remove_marker_if_owned "$READY_FILE" "$owner"
+      remove_marker_if_owned "$OWNER_FILE" "$owner"
+    }
     return 0
   fi
-  if ! pid_is_running "$pid"; then
+  if ! controller_is_owned "$pid" "$owner"; then
     echo "$MODEL_NAME controller STOPPED"
-    remove_marker_if_owned "$PID_FILE" "$pid"
-    remove_marker_if_owned "$READY_FILE" "$pid"
+    remove_controller_state "$pid" "$owner"
     return 0
   fi
 
-  kill -TERM "$pid"
+  kill -TERM -- "-$pid"
   local attempt
   for ((attempt=0; attempt<300; attempt++)); do
-    if ! pid_is_running "$pid"; then
-      remove_marker_if_owned "$PID_FILE" "$pid"
-      remove_marker_if_owned "$READY_FILE" "$pid"
+    if ! controller_is_owned "$pid" "$owner"; then
+      remove_controller_state "$pid" "$owner"
       echo "$MODEL_NAME controller STOPPED"
       return 0
     fi
@@ -452,6 +525,10 @@ case "$action" in
   status) show_status ;;
   logs) follow_logs ;;
   stop) stop_controller ;;
-  __controller) run_controller ;;
+  __controller)
+    CONTROLLER_OWNER=${2:-direct.$$}
+    [[ $CONTROLLER_OWNER =~ ^[a-zA-Z0-9._-]+$ ]] || die "invalid controller owner token"
+    run_controller
+    ;;
   *) die "usage: $0 [start|status|logs|stop]" ;;
 esac
