@@ -53,16 +53,31 @@ class ThreeClusterLauncherTests(unittest.TestCase):
             """#!/usr/bin/env bash
 set -euo pipefail
 if [[ $* == *'import site; print'* ]]; then
-  echo /tmp/fake-site-packages
+  echo "$FAKE_SITE_PACKAGES"
 elif [[ $* == *'from pathlib import Path; import torch'* ]]; then
-  echo /tmp/fake-torch/lib
+  echo "$FAKE_TORCH_LIB"
+elif [[ $* == *'import torch; import megatron.core'* ]]; then
+  if [[ -n ${FAKE_PREFLIGHT_LOG:-} ]]; then
+    printf 'preflight\\t%s\\t%s\\n' "${CUDA_HOME:-missing}" \
+      "${LD_LIBRARY_PATH:-missing}" >> "$FAKE_PREFLIGHT_LOG"
+  fi
 elif [[ ${1:-} == -m && ${2:-} == torch.distributed.run ]]; then
   if [[ -n ${FAKE_PYTHON_LOG:-} ]]; then
-    printf 'launch\\t%s\\t%s\\t%s\\n' \
+    printf 'launch\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \
       "${MEGATRON_LR_WARMUP_ITERS:-missing}" \
-      "${MEGATRON_LR_DECAY_ITERS:-missing}" "$*" >> "$FAKE_PYTHON_LOG"
+      "${MEGATRON_LR_DECAY_ITERS:-missing}" \
+      "${MEGATRON_LOAD_CHECKPOINT:-missing}" \
+      "${MEGATRON_RESUME_FROM:-missing}" "${DRY_RUN:-missing}" "$*" \
+      >> "$FAKE_PYTHON_LOG"
   fi
-  sleep 0.3
+  if [[ -n ${FAKE_REMOTE_PIDS:-} ]]; then
+    printf '%s\\n' "$$" >> "$FAKE_REMOTE_PIDS"
+  fi
+  if [[ ${FAKE_PYTHON_BLOCK:-0} == 1 ]]; then
+    trap 'exit 0' TERM INT
+    while :; do sleep 0.05; done
+  fi
+  sleep 0.8
 fi
 exit 0
 """
@@ -76,6 +91,15 @@ exit 0
             "#!/usr/bin/env bash\nprintf '%s\\n' 0 1 2 3 4 5 6 7\n"
         )
         fake_nvidia_smi.chmod(0o755)
+
+        cuda_home = root / "cuda-13.2"
+        (cuda_home / "lib64").mkdir(parents=True)
+        fake_site_packages = root / "site-packages"
+        (fake_site_packages / "nvidia" / "fake-wheel" / "lib").mkdir(
+            parents=True
+        )
+        fake_torch_lib = root / "torch" / "lib"
+        fake_torch_lib.mkdir(parents=True)
 
         fake_ssh_calls = root / "ssh-calls.log"
         fake_ssh_pids = root / "ssh-pids.log"
@@ -101,16 +125,12 @@ for ((i=host_index + 1; i<${#args[@]}; i++)); do
   [[ -z $remote_command ]] || remote_command+=' '
   remote_command+=${args[$i]}
 done
-if [[ ${FAKE_SSH_EXEC_REMOTE:-0} == 1 ]]; then
-  bash -c "$remote_command" < "$remote_script"
-  exit $?
-fi
 eval "set -- $remote_command"
 parsed=("$@")
 mode=
 mode_index=-1
 for ((i=0; i<${#parsed[@]}; i++)); do
-  if [[ ${parsed[$i]} == preflight || ${parsed[$i]} == launch ]]; then
+  if [[ ${parsed[$i]} == preflight || ${parsed[$i]} == launch || ${parsed[$i]} == terminate ]]; then
     mode=${parsed[$i]}
     mode_index=$i
   fi
@@ -121,6 +141,17 @@ if [[ $mode == preflight ]]; then
     "${parsed[$((mode_index + 4))]}" "${parsed[$((mode_index + 5))]}" \
     "${parsed[$((mode_index + 6))]}" >> "$FAKE_SSH_CALLS"
   [[ ${FAKE_SSH_FAIL_PREFLIGHT_HOST:-} != "$host" ]] || exit 23
+elif [[ $mode == terminate ]]; then
+  printf 'terminate\\t%s\\t%s\\t%s\\n' "$host" \
+    "${parsed[$((mode_index + 1))]}" "${parsed[$((mode_index + 2))]}" \
+    >> "$FAKE_SSH_CALLS"
+  [[ ${FAKE_SSH_FAIL_TERMINATE_HOST:-} != "$host" ]] || exit 24
+fi
+if [[ ${FAKE_SSH_EXEC_REMOTE:-0} == 1 ]]; then
+  bash -c "$remote_command" < "$remote_script"
+  exit $?
+fi
+if [[ $mode == preflight || $mode == terminate ]]; then
   exit 0
 fi
 model=${parsed[$((mode_index + 8))]}
@@ -150,6 +181,7 @@ sleep 0.8
         env.update(
             {
                 "PATH": f"{fake_bin}:{env['PATH']}",
+                "CUDA_HOME": str(cuda_home),
                 "HOSTFILE": str(hostfile),
                 "PYTHON_BIN": str(python_bin),
                 "TRAIN_TOKENS_FILE": str(train_tokens),
@@ -162,6 +194,9 @@ sleep 0.8
                 "STARTUP_TIMEOUT": "5",
                 "FAKE_SSH_CALLS": str(fake_ssh_calls),
                 "FAKE_SSH_PIDS": str(fake_ssh_pids),
+                "FAKE_REMOTE_PIDS": str(root / "remote-pids.log"),
+                "FAKE_SITE_PACKAGES": str(fake_site_packages),
+                "FAKE_TORCH_LIB": str(fake_torch_lib),
             }
         )
         return env, hostfile, fake_ssh_calls, log_dir, pid_file
@@ -217,6 +252,19 @@ sleep 0.8
                     return pids
             if time.monotonic() >= deadline:
                 self.fail(f"fake SSH did not record {expected} launch PIDs")
+            time.sleep(0.05)
+
+    def poll_pid_file(
+        self, path: Path, expected: int = 4, timeout: float = 5
+    ) -> list[int]:
+        deadline = time.monotonic() + timeout
+        while True:
+            if path.exists():
+                pids = [int(line) for line in path.read_text().splitlines()]
+                if len(pids) >= expected:
+                    return pids
+            if time.monotonic() >= deadline:
+                self.fail(f"{path} did not record {expected} PIDs")
             time.sleep(0.05)
 
     def process_exists(self, pid: int) -> bool:
@@ -666,6 +714,266 @@ sleep 0.8
 
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("node rank 2 (10.0.0.3): FAILED", completed.stdout)
+
+    def test_stop_explicitly_terminates_and_verifies_remote_owned_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, _hostfile, fake_calls, _log_dir, pid_file = self.make_runtime(root)
+            env["FAKE_SSH_EXEC_REMOTE"] = "1"
+            env["FAKE_PYTHON_BLOCK"] = "1"
+            remote_pid_file = Path(env["FAKE_REMOTE_PIDS"])
+            remote_pids: list[int] = []
+            try:
+                started = self.run_entry("train_7b_baseline_4node.sh", env, "start")
+                self.assertEqual(started.returncode, 0, started.stderr)
+                remote_pids = self.poll_pid_file(remote_pid_file)
+
+                stopped = self.run_entry(
+                    "train_7b_baseline_4node.sh", env, "stop", timeout=35
+                )
+
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+                calls = fake_calls.read_text().splitlines()
+                terminations = [
+                    line.split("\t")
+                    for line in calls
+                    if line.startswith("terminate\t")
+                ]
+                self.assertEqual(len(terminations), 4)
+                self.assertEqual({line[1] for line in terminations}, set(HOSTS))
+                self.assertEqual(len({line[2] for line in terminations}), 4)
+                self.assertEqual(len({line[3] for line in terminations}), 4)
+                self.assertTrue(
+                    all(line[2].startswith("/tmp/dual-attentions-baseline-") for line in terminations)
+                )
+                self.assertTrue(
+                    all(line[3].endswith(f".rank{rank}") for rank, line in enumerate(terminations))
+                )
+                self.assertEqual(
+                    [pid for pid in remote_pids if self.process_exists(pid)], []
+                )
+                self.assertFalse(pid_file.exists())
+                self.assertFalse(Path(f"{pid_file}.owner").exists())
+            finally:
+                self.stop_test_processes(remote_pids)
+
+    def test_failed_remote_termination_retains_lifecycle_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _hostfile, _fake_calls, _log_dir, pid_file = self.make_runtime(
+                Path(tmp)
+            )
+            env["FAKE_SSH_BLOCK"] = "1"
+            env["FAKE_SSH_FAIL_TERMINATE_HOST"] = "10.0.0.3"
+
+            started = self.run_entry("train_7b_baseline_4node.sh", env, "start")
+            self.assertEqual(started.returncode, 0, started.stderr)
+
+            stopped = self.run_entry("train_7b_baseline_4node.sh", env, "stop")
+
+            self.assertNotEqual(stopped.returncode, 0)
+            self.assertIn("remote cleanup did not complete", stopped.stderr)
+            self.assertTrue(pid_file.exists())
+            self.assertTrue(Path(f"{pid_file}.owner").exists())
+            self.assertTrue(Path(f"{pid_file}.cleanup_failed").exists())
+
+    def test_startup_failure_retains_state_when_remote_cleanup_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _hostfile, _fake_calls, _log_dir, pid_file = self.make_runtime(
+                Path(tmp)
+            )
+            env["FAKE_SSH_FAIL_LAUNCH_RANK"] = "2"
+            env["FAKE_SSH_FAIL_TERMINATE_HOST"] = "10.0.0.3"
+
+            started = self.run_entry("train_7b_baseline_4node.sh", env, "start")
+
+            self.assertNotEqual(started.returncode, 0)
+            self.assertIn("remote cleanup did not complete", started.stderr)
+            self.assertTrue(pid_file.exists())
+            self.assertTrue(Path(f"{pid_file}.owner").exists())
+            self.assertTrue(Path(f"{pid_file}.cleanup_failed").exists())
+
+    def test_concurrent_starts_publish_exactly_one_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _hostfile, fake_calls, _log_dir, _pid_file = self.make_runtime(
+                Path(tmp)
+            )
+            command = ["bash", str(SCRIPTS / "train_7b_baseline_4node.sh"), "start"]
+            first = subprocess.Popen(
+                command,
+                cwd=REPOSITORY,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            second = subprocess.Popen(
+                command,
+                cwd=REPOSITORY,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            first_output = first.communicate(timeout=10)
+            second_output = second.communicate(timeout=10)
+            time.sleep(1)
+
+            return_codes = [first.returncode, second.returncode]
+            self.assertEqual(return_codes.count(0), 1, (first_output, second_output))
+            self.assertEqual(
+                return_codes.count(2), 1, (first_output, second_output)
+            )
+            calls = fake_calls.read_text().splitlines()
+            self.assertEqual(sum(line.startswith("launch\t") for line in calls), 4)
+
+    def test_remote_launch_clears_resume_controls_and_forces_real_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, _hostfile, _fake_calls, _log_dir, _pid_file = self.make_runtime(
+                root
+            )
+            python_log = root / "python-controls.log"
+            env.update(
+                {
+                    "FAKE_SSH_EXEC_REMOTE": "1",
+                    "FAKE_PYTHON_LOG": str(python_log),
+                    "MEGATRON_LOAD_CHECKPOINT": "/unsafe/load",
+                    "MEGATRON_RESUME_FROM": "/unsafe/resume",
+                    "DRY_RUN": "1",
+                }
+            )
+
+            completed = self.run_entry(
+                "train_7b_baseline_4node.sh", env, "__controller"
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            launches = (
+                [line.split("\t") for line in python_log.read_text().splitlines()]
+                if python_log.exists()
+                else []
+            )
+            self.assertEqual(len(launches), 4)
+            self.assertEqual([line[3] for line in launches], ["missing"] * 4)
+            self.assertEqual([line[4] for line in launches], ["missing"] * 4)
+            self.assertEqual([line[5] for line in launches], ["0"] * 4)
+
+    def test_preflight_imports_use_the_same_clean_cuda_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, _hostfile, _fake_calls, _log_dir, _pid_file = self.make_runtime(
+                root
+            )
+            preflight_log = root / "preflight-imports.log"
+            env.update(
+                {
+                    "FAKE_SSH_EXEC_REMOTE": "1",
+                    "FAKE_PREFLIGHT_LOG": str(preflight_log),
+                }
+            )
+
+            completed = self.run_entry(
+                "train_7b_baseline_4node.sh", env, "__controller"
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            imports = [line.split("\t") for line in preflight_log.read_text().splitlines()]
+            self.assertEqual(len(imports), 4)
+            expected_ld = ":".join(
+                (
+                    str(Path(env["CUDA_HOME"]) / "lib64"),
+                    str(
+                        Path(env["FAKE_SITE_PACKAGES"])
+                        / "nvidia"
+                        / "fake-wheel"
+                        / "lib"
+                    ),
+                    env["FAKE_TORCH_LIB"],
+                    "/usr/local/nvidia/lib",
+                    "/usr/local/nvidia/lib64",
+                )
+            )
+            self.assertEqual([line[1] for line in imports], [env["CUDA_HOME"]] * 4)
+            self.assertEqual([line[2] for line in imports], [expected_ld] * 4)
+
+    def test_higher_rank_failure_interrupts_blocked_rank_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _hostfile, _fake_calls, log_dir, _pid_file = self.make_runtime(
+                Path(tmp)
+            )
+            env["FAKE_SSH_BLOCK"] = "1"
+            env["FAKE_SSH_DELAYED_FAIL_LAUNCH_RANK"] = "3"
+            ssh_pids: list[int] = []
+            try:
+                started = self.run_entry("train_7b_baseline_4node.sh", env, "start")
+                self.assertEqual(started.returncode, 0, started.stderr)
+                ssh_pids = self.poll_recorded_pids(env)
+
+                stopped = self.poll_status(
+                    "train_7b_baseline_4node.sh", env, "STOPPED", timeout=3
+                )
+
+                self.assertEqual(stopped.returncode, 1)
+                controller_log = log_dir / "baseline_controller.log"
+                self.assertIn(
+                    "node rank 3 (10.0.0.4): FAILED", controller_log.read_text()
+                )
+            finally:
+                self.run_entry("train_7b_baseline_4node.sh", env, "stop", timeout=35)
+                self.stop_test_processes(ssh_pids)
+
+    def test_fixed_topology_and_schedule_bounds_are_enforced(self) -> None:
+        invalid = (
+            ({"GPUS_PER_NODE": "7"}, "GPUS_PER_NODE must be exactly 8"),
+            ({"MASTER_PORT": "0"}, "MASTER_PORT must be in range 1..65535"),
+            ({"MASTER_PORT": "65536"}, "MASTER_PORT must be in range 1..65535"),
+            (
+                {"TRAIN_ITERS": "10", "WARMUP_ITERS": "10"},
+                "WARMUP_ITERS must satisfy 0 <= WARMUP_ITERS < TRAIN_ITERS",
+            ),
+            (
+                {"TRAIN_ITERS": "10", "WARMUP_ITERS": "11"},
+                "WARMUP_ITERS must satisfy 0 <= WARMUP_ITERS < TRAIN_ITERS",
+            ),
+        )
+        for overrides, error in invalid:
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as tmp:
+                env, _hostfile, _fake_calls, _log_dir, _pid_file = self.make_runtime(
+                    Path(tmp)
+                )
+                env.update(overrides)
+                env["DRY_RUN"] = "1"
+
+                completed = self.run_entry("train_7b_baseline_4node.sh", env)
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(error, completed.stderr)
+
+    def test_stop_accepts_natural_controller_exit_before_group_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, _hostfile, _fake_calls, _log_dir, _pid_file = self.make_runtime(
+                root
+            )
+            bash_env = root / "delay-controller-kill.sh"
+            bash_env.write_text(
+                """kill() {
+  if [[ ${1:-} == -TERM && ${2:-} == -- && ${3:-} == -* ]]; then
+    sleep 0.5
+  fi
+  builtin kill "$@"
+}
+"""
+            )
+
+            started = self.run_entry("train_7b_baseline_4node.sh", env, "start")
+            self.assertEqual(started.returncode, 0, started.stderr)
+            env["BASH_ENV"] = str(bash_env)
+
+            stopped = self.run_entry("train_7b_baseline_4node.sh", env, "stop")
+
+            self.assertEqual(stopped.returncode, 0, stopped.stderr)
+            self.assertIn("STOPPED", stopped.stdout)
 
 
 if __name__ == "__main__":
