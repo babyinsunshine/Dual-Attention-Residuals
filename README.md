@@ -188,6 +188,48 @@ bash scripts/launch_baseline_ssh.sh
 Set `HOSTS` to a whitespace-separated, node-rank-ordered list to use another
 cluster. `MASTER_ADDR` defaults to the first host.
 
+### Three independent 7B four-node runs
+
+The Baseline, Attention Residual, and DAR jobs use separate hostfiles at the
+repository root: `hostfile_baseline`, `hostfile_attnres`, and `hostfile_dar`.
+Each file must contain exactly four unique hosts in node-rank order, one per
+line. Blank lines and comments are allowed; the first host is rank zero and the
+rendezvous master. For example:
+
+```text
+10.0.0.1
+10.0.0.2
+10.0.0.3
+10.0.0.4
+```
+
+Before launching, finalize both token files at
+`data/fineweb_100BT_pretok/train.bin` and
+`data/fineweb_100BT_pretok/val.bin`. Partial files are rejected, as is a
+non-empty output directory. Start each supervised controller with:
+
+```bash
+bash scripts/train_7b_baseline_4node.sh start
+bash scripts/train_7b_attnres_4node.sh start
+bash scripts/train_7b_dar_4node.sh start
+```
+
+Each model has independent output, controller, PID, and per-rank log paths.
+Use the same entry script for lifecycle operations:
+
+```bash
+bash scripts/train_7b_dar_4node.sh status
+bash scripts/train_7b_dar_4node.sh logs
+bash scripts/train_7b_dar_4node.sh stop
+```
+
+At global batch size 128 and sequence length 4,096, each iteration processes
+`128 * 4,096 = 524,288` token positions. The 40,000-iteration schedule
+therefore processes `524,288 * 40,000 = 20,971,520,000` token positions
+(20.97B). Before any production start, run a one-iteration smoke test on each
+four-node group with a separate empty `OUTPUT_DIR`; do not reuse a production
+output directory for the smoke test.
+
 ## Default configuration
 
 | Setting | Value |
