@@ -858,6 +858,8 @@ def print_grad_debug(model: torch.nn.Module, optimizer, step: int) -> None:
         "dual_mix": (
             "attn_q",
             "mlp_q",
+            "attn_states",
+            "mlp_states",
             "static_alpha",
             "static_beta",
             "dynamic_ab_fn",
@@ -911,6 +913,8 @@ def capture_update_debug(model: torch.nn.Module):
         "mlp_res_proj",
         "attn_q",
         "mlp_q",
+        "attn_states",
+        "mlp_states",
         "dynamic_ab_fn",
         "linear_fc",
     )
@@ -955,6 +959,8 @@ def _dual_tp_debug_patterns() -> tuple[str, ...]:
         "mlp_res_k_proj",
         "attn_q",
         "mlp_q",
+        "attn_states",
+        "mlp_states",
         "attn_dynamic_ab_fn",
         "mlp_dynamic_ab_fn",
         "attn_dynamic_residual_mix_fn",

@@ -1,10 +1,10 @@
-# Per-Layer Residual Queries Implementation Plan
+# Per-Sublayer Residual State Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Give every AttnRes and Dual atomic attention/MLP sublayer its own residual query parameters and prevent query-dependent cache reuse across layers.
+**Goal:** Give every AttnRes and Dual atomic attention/MLP sublayer its own complete residual state and prevent state-dependent cache reuse across layers.
 
-**Architecture:** Each residual block owns `attn_qs` and `mlp_qs` `nn.ParameterList` objects indexed by local atomic-layer position. Forward loops select the matching pair at every layer, while history values remain block-scoped and query-dependent prefix/logit caches become layer-scoped.
+**Architecture:** AttnRes retains per-layer query `ParameterList` objects. Dual owns `attn_states` and `mlp_states` `ModuleList` objects whose entries contain a query, alpha/beta, residual gates, norms, and dynamic mixing matrices. Forward loops select one complete state per residual read; history values remain block-scoped and state-dependent keys/prefixes/logits use safe cache keys.
 
 **Tech Stack:** Python, PyTorch `nn.ParameterList`, Megatron-Core parameter metadata, Triton paired-prefix interfaces, `pytest`/`unittest`.
 
@@ -15,7 +15,11 @@
 - AttnRes queries keep zero initialization.
 - Dual query pairs use `init_dual_stream_query_` with the atomic layer's global layer index.
 - All query parameters retain `sequence_parallel=True` metadata.
-- Alpha, beta, residual gates, key projections, norms, and dynamic mixing matrices remain block-scoped.
+- Every Dual attention and MLP sublayer owns independent alpha, beta, residual
+  gates, mixing norm, history-key norm, and dynamic mixing matrices.
+- Only parameterless, identically configured history-key norms may reuse a
+  derived key tensor; this is numerical common-subexpression elimination, not
+  module or parameter sharing.
 - Existing paired Triton paths remain enabled but execute once per atomic layer.
 - Old checkpoints are intentionally incompatible and receive no migration path.
 - Preserve unrelated user changes in `dual_attentions_residuals/mcore_compat.py` and untracked benchmark configs.
@@ -222,3 +226,60 @@ query names.
 Fast-forward the verified feature branch into `main`, preserve unrelated dirty
 files, and run `python -m unittest discover -s tests` again on the merged tree.
 
+### Task 5: Replace the Incomplete Dual State Split
+
+**Files:**
+- Modify: `dual_attentions_residuals/residual_blocks.py:1564-2624`
+- Modify: `tests/test_per_layer_residual_queries.py`
+- Modify: `train.py:840-975`
+
+**Interfaces:**
+- Consumes: `DualAttentionResidualBlock(config, layers, layer_index)`.
+- Produces: `attn_states: nn.ModuleList` and `mlp_states: nn.ModuleList`, with
+  one complete residual-state module per atomic attention/MLP sublayer.
+
+- [ ] **Step 1: Write failing ownership and forward-wiring tests**
+
+For block size three, assert six distinct state objects. For every learnable
+field (`q`, `static_alpha`, `static_beta`, `dynamic_ab_fn`,
+`dynamic_residual_mix_fn`, `static_residual_logit`, `pre_branch_scale`,
+`h_post_scale`, and `residual_scale`), assert six distinct parameter objects and
+storage pointers. Assert distinct `norm` and `history_key_norm` module objects.
+Patch the residual-read helper and assert the forward order is
+`attn_states[0], mlp_states[0], ..., attn_states[2], mlp_states[2]`.
+
+- [ ] **Step 2: Run the focused test and observe the architectural failure**
+
+Run `python -m pytest tests/test_per_layer_residual_queries.py -q`. Expected:
+the new assertions fail because `attn_states`/`mlp_states` do not exist and the
+non-query state remains block-scoped.
+
+- [ ] **Step 3: Introduce a complete Dual sublayer-state module**
+
+Move initialization of all per-read learnable state and both fixed norm modules
+into `_DualResidualSublayerState`. Construct independent attention and MLP
+instances for every local layer using the atomic layer's global index. Mark all
+learnable state parameters `sequence_parallel=True`.
+
+- [ ] **Step 4: Wire one complete state through every reference and fused path**
+
+Select the attention/MLP state inside the layer loop. Pass it through history
+attention, scalar mixing, deferred keep mixing, and Triton fused residual-read
+paths. Build fused dynamic weights separately for each selected state.
+
+- [ ] **Step 5: Make history-key caching norm-aware**
+
+Derive history keys with the selected state's `history_key_norm`. Reuse keys
+only for parameterless norm instances with the same type, epsilon, and FP32
+mode. Keep query-derived prefix/logit caches keyed by local layer and sublayer.
+
+- [ ] **Step 6: Update diagnostics and verify locally**
+
+Teach `train.py` diagnostics to match `attn_states`/`mlp_states`, then run the
+focused test, full test suite, and `git diff --check`.
+
+- [ ] **Step 7: Verify on H800 and commit**
+
+Run two-GPU TP=2 forward/backward smoke tests for reference and fused modes.
+Confirm every per-sublayer parameter has a finite gradient and TP replicas match,
+then commit only the implementation, tests, diagnostics, and corrected docs.

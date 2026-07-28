@@ -367,6 +367,20 @@ class FixedRMSNorm(nn.Module):
         return F.rms_norm(x, (x.shape[-1],), eps=self.eps)
 
 
+def _dual_history_norm_cache_key(history_key_norm: nn.Module) -> tuple:
+    # FixedRMSNorm is fully described by these two public fields and has no
+    # learnable state, so equal instances are safe common subexpressions.
+    # Other modules may have behavior outside parameters/eps; keep them by
+    # identity rather than guessing at equivalence.
+    if type(history_key_norm) is FixedRMSNorm:
+        return (
+            "fixed_rms_norm",
+            history_key_norm.eps,
+            history_key_norm.force_fp32,
+        )
+    return ("module", id(history_key_norm))
+
+
 def _rebuild_attres_history_keys(
     blocks: tuple[torch.Tensor, ...],
     norm_eps: float,
@@ -1561,6 +1575,86 @@ class AttentionResidualOutputAggregation(nn.Module):
         )
 
 
+class _DualResidualSublayerState(nn.Module):
+    """All learnable and normalization state for one atomic residual read."""
+
+    def __init__(
+        self,
+        config,
+        *,
+        global_layer_index: int,
+        dual_norm_fp32: bool,
+        param_dtype: torch.dtype,
+        static_residual_logit: float,
+    ) -> None:
+        super().__init__()
+        num_streams = 2
+        hidden_size = int(config.model.hidden_size)
+        init_stream = global_layer_index % num_streams
+
+        self.history_key_norm = FixedRMSNorm(
+            config.model.layernorm_epsilon,
+            force_fp32=dual_norm_fp32,
+        )
+        self.norm = FixedRMSNorm(
+            config.model.layernorm_epsilon,
+            force_fp32=dual_norm_fp32,
+        )
+        self.pre_branch_scale = nn.Parameter(torch.full((), 1e-2, dtype=param_dtype))
+        self.h_post_scale = nn.Parameter(torch.full((), 1e-2, dtype=param_dtype))
+        self.residual_scale = nn.Parameter(torch.full((), 1e-2, dtype=param_dtype))
+
+        if _DUAL_AB_INIT in {"near_attres", "attres_near", "near_attres_asym"}:
+            alpha_base = _optional_float(_DUAL_STATIC_ALPHA_LOGIT, 0.0)
+            alpha_eps = abs(float(_DUAL_AB_SYMMETRY_BREAK_LOGIT))
+            static_alpha = torch.full((num_streams, 1), alpha_base, dtype=param_dtype)
+            static_alpha[init_stream, 0] = alpha_base + alpha_eps
+            static_alpha[1 - init_stream, 0] = alpha_base - alpha_eps
+        elif _DUAL_AB_INIT in {"neutral", "zero", "balanced"}:
+            static_alpha = torch.zeros((num_streams, 1), dtype=param_dtype)
+            if _DUAL_STATIC_ALPHA_LOGIT is not None and _DUAL_STATIC_ALPHA_LOGIT != "":
+                static_alpha.fill_(float(_DUAL_STATIC_ALPHA_LOGIT))
+        else:
+            alpha_logit = abs(_optional_float(_DUAL_STATIC_ALPHA_LOGIT, 1.0))
+            static_alpha = torch.full((num_streams, 1), -alpha_logit, dtype=param_dtype)
+            static_alpha[init_stream, 0] = alpha_logit
+        self.static_alpha = nn.Parameter(static_alpha)
+        self.dynamic_ab_fn = nn.Parameter(
+            torch.zeros(hidden_size * num_streams, num_streams * 2, dtype=param_dtype)
+        )
+
+        if _DUAL_AB_INIT in {"near_attres", "attres_near", "near_attres_asym"}:
+            beta_base = _optional_float(_DUAL_STATIC_BETA_LOGIT, 0.0)
+            beta_eps = abs(float(_DUAL_AB_SYMMETRY_BREAK_LOGIT))
+            static_beta = torch.full((num_streams,), beta_base, dtype=param_dtype)
+            static_beta[init_stream] = beta_base + beta_eps
+            static_beta[1 - init_stream] = beta_base - beta_eps
+        elif _DUAL_AB_INIT in {"neutral", "zero", "balanced"}:
+            static_beta = torch.zeros((num_streams,), dtype=param_dtype)
+            if _DUAL_STATIC_BETA_LOGIT is not None and _DUAL_STATIC_BETA_LOGIT != "":
+                static_beta.fill_(float(_DUAL_STATIC_BETA_LOGIT))
+        else:
+            beta_logit = abs(_optional_float(_DUAL_STATIC_BETA_LOGIT, 1.0))
+            static_beta = torch.full((num_streams,), -beta_logit, dtype=param_dtype)
+            static_beta[init_stream] = beta_logit
+        self.static_beta = nn.Parameter(static_beta)
+        self.static_residual_logit = nn.Parameter(
+            torch.tensor(static_residual_logit, dtype=param_dtype)
+        )
+        self.dynamic_residual_mix_fn = nn.Parameter(
+            torch.zeros(hidden_size * num_streams, 1, dtype=param_dtype)
+        )
+        self.q = nn.Parameter(torch.empty(num_streams, hidden_size, dtype=param_dtype))
+        init_dual_stream_query_(
+            self.q,
+            preferred_stream=init_stream,
+            balanced=_DUAL_Q_BALANCED,
+        )
+
+    def fused_weight(self) -> torch.Tensor:
+        return torch.cat((self.dynamic_ab_fn, self.dynamic_residual_mix_fn), dim=-1)
+
+
 class DualAttentionResidualBlock(nn.Module):
     _history_key = "history"
     _cache_key = "history_cache"
@@ -1576,51 +1670,7 @@ class DualAttentionResidualBlock(nn.Module):
         self.last_aux_loss: Optional[torch.Tensor] = None
         self.num_streams = 2
         dual_norm_fp32 = _env_bool("MEGATRON_DUAL_RMSNORM_FP32", True)
-        self.history_key_norm = FixedRMSNorm(config.model.layernorm_epsilon, force_fp32=dual_norm_fp32)
-        self.norm = FixedRMSNorm(config.model.layernorm_epsilon, force_fp32=dual_norm_fp32)
         param_dtype = _train_param_dtype(config)
-        self.pre_branch_scale = nn.Parameter(torch.full((), 1e-2, dtype=param_dtype))
-        self.h_post_scale = nn.Parameter(torch.full((), 1e-2, dtype=param_dtype))
-        self.residual_scale = nn.Parameter(torch.full((), 1e-2, dtype=param_dtype))
-        init_stream = layer_index % self.num_streams
-        if _DUAL_AB_INIT in {"near_attres", "attres_near", "near_attres_asym"}:
-            alpha_base = _optional_float(_DUAL_STATIC_ALPHA_LOGIT, 0.0)
-            alpha_eps = abs(float(_DUAL_AB_SYMMETRY_BREAK_LOGIT))
-            static_alpha = torch.full((self.num_streams, 1), alpha_base, dtype=param_dtype)
-            static_alpha[init_stream, 0] = alpha_base + alpha_eps
-            static_alpha[1 - init_stream, 0] = alpha_base - alpha_eps
-        elif _DUAL_AB_INIT in {"neutral", "zero", "balanced"}:
-            static_alpha = torch.zeros((self.num_streams, 1), dtype=param_dtype)
-            if _DUAL_STATIC_ALPHA_LOGIT is not None and _DUAL_STATIC_ALPHA_LOGIT != "":
-                static_alpha.fill_(float(_DUAL_STATIC_ALPHA_LOGIT))
-        else:
-            alpha_logit = abs(_optional_float(_DUAL_STATIC_ALPHA_LOGIT, 1.0))
-            static_alpha = torch.full((self.num_streams, 1), -alpha_logit, dtype=param_dtype)
-            static_alpha[init_stream, 0] = alpha_logit
-        self.attn_static_alpha = nn.Parameter(static_alpha.clone())
-        self.mlp_static_alpha = nn.Parameter(static_alpha.clone())
-        self.attn_dynamic_ab_fn = nn.Parameter(
-            torch.zeros(config.model.hidden_size * self.num_streams, self.num_streams * 2, dtype=param_dtype)
-        )
-        self.mlp_dynamic_ab_fn = nn.Parameter(
-            torch.zeros(config.model.hidden_size * self.num_streams, self.num_streams * 2, dtype=param_dtype)
-        )
-        if _DUAL_AB_INIT in {"near_attres", "attres_near", "near_attres_asym"}:
-            beta_base = _optional_float(_DUAL_STATIC_BETA_LOGIT, 0.0)
-            beta_eps = abs(float(_DUAL_AB_SYMMETRY_BREAK_LOGIT))
-            static_beta = torch.full((self.num_streams,), beta_base, dtype=param_dtype)
-            static_beta[init_stream] = beta_base + beta_eps
-            static_beta[1 - init_stream] = beta_base - beta_eps
-        elif _DUAL_AB_INIT in {"neutral", "zero", "balanced"}:
-            static_beta = torch.zeros((self.num_streams,), dtype=param_dtype)
-            if _DUAL_STATIC_BETA_LOGIT is not None and _DUAL_STATIC_BETA_LOGIT != "":
-                static_beta.fill_(float(_DUAL_STATIC_BETA_LOGIT))
-        else:
-            beta_logit = abs(_optional_float(_DUAL_STATIC_BETA_LOGIT, 1.0))
-            static_beta = torch.full((self.num_streams,), -beta_logit, dtype=param_dtype)
-            static_beta[init_stream] = beta_logit
-        self.attn_static_beta = nn.Parameter(static_beta.clone())
-        self.mlp_static_beta = nn.Parameter(static_beta.clone())
         if _DUAL_STATIC_RESIDUAL_LOGIT is not None and _DUAL_STATIC_RESIDUAL_LOGIT != "":
             static_residual_logit = float(_DUAL_STATIC_RESIDUAL_LOGIT)
         else:
@@ -1628,52 +1678,19 @@ class DualAttentionResidualBlock(nn.Module):
             static_residual_logit = float(
                 getattr(config.model, "hyper_conn_dual_static_residual_logit", default_static_residual_logit)
             )
-        self.attn_static_residual_logit = nn.Parameter(torch.tensor(static_residual_logit, dtype=param_dtype))
-        self.mlp_static_residual_logit = nn.Parameter(torch.tensor(static_residual_logit, dtype=param_dtype))
-        self.attn_dynamic_residual_mix_fn = nn.Parameter(
-            torch.zeros(config.model.hidden_size * self.num_streams, 1, dtype=param_dtype)
-        )
-        self.mlp_dynamic_residual_mix_fn = nn.Parameter(
-            torch.zeros(config.model.hidden_size * self.num_streams, 1, dtype=param_dtype)
-        )
-        self.attn_qs = nn.ParameterList()
-        self.mlp_qs = nn.ParameterList()
+        self.attn_states = nn.ModuleList()
+        self.mlp_states = nn.ModuleList()
         for local_layer_index in range(len(self.layers)):
-            preferred_stream = (layer_index + local_layer_index) % self.num_streams
-            attn_q = nn.Parameter(
-                torch.empty(self.num_streams, config.model.hidden_size, dtype=param_dtype)
-            )
-            mlp_q = nn.Parameter(
-                torch.empty(self.num_streams, config.model.hidden_size, dtype=param_dtype)
-            )
-            init_dual_stream_query_(
-                attn_q,
-                preferred_stream=preferred_stream,
-                balanced=_DUAL_Q_BALANCED,
-            )
-            init_dual_stream_query_(
-                mlp_q,
-                preferred_stream=preferred_stream,
-                balanced=_DUAL_Q_BALANCED,
-            )
-            self.attn_qs.append(attn_q)
-            self.mlp_qs.append(mlp_q)
+            state_kwargs = {
+                "global_layer_index": layer_index + local_layer_index,
+                "dual_norm_fp32": dual_norm_fp32,
+                "param_dtype": param_dtype,
+                "static_residual_logit": static_residual_logit,
+            }
+            self.attn_states.append(_DualResidualSublayerState(config, **state_kwargs))
+            self.mlp_states.append(_DualResidualSublayerState(config, **state_kwargs))
         _mark_sequence_parallel_parameters(
-            self.pre_branch_scale,
-            self.h_post_scale,
-            self.residual_scale,
-            self.attn_static_alpha,
-            self.mlp_static_alpha,
-            self.attn_dynamic_ab_fn,
-            self.mlp_dynamic_ab_fn,
-            self.attn_static_beta,
-            self.mlp_static_beta,
-            self.attn_static_residual_logit,
-            self.mlp_static_residual_logit,
-            self.attn_dynamic_residual_mix_fn,
-            self.mlp_dynamic_residual_mix_fn,
-            *self.attn_qs,
-            *self.mlp_qs,
+            *(parameter for state in (*self.attn_states, *self.mlp_states) for parameter in state.parameters())
         )
         block_layers = max(1, int(config.model.hyper_conn_block_layers))
         self.max_history_len = (2 * config.model.num_layers) + 1 if self.full_history else (config.model.num_layers // block_layers) + 1
@@ -1693,11 +1710,38 @@ class DualAttentionResidualBlock(nn.Module):
             value = value.flip(0)
         return value.contiguous()
 
-    def _normalize_history_key(self, value: torch.Tensor) -> torch.Tensor:
-        key = self.history_key_norm(value).transpose(0, 2)
+    def _normalize_history_key(
+        self,
+        value: torch.Tensor,
+        history_key_norm: nn.Module,
+    ) -> torch.Tensor:
+        key = history_key_norm(value).transpose(0, 2)
         if _DUAL_KV_MODE == "crossk_selfv":
             key = key.flip(0)
         return key.contiguous()
+
+    @staticmethod
+    def _history_norm_cache_key(history_key_norm: nn.Module) -> tuple:
+        return _dual_history_norm_cache_key(history_key_norm)
+
+    def _history_keys(
+        self,
+        cache: dict,
+        history_key_norm: nn.Module,
+    ) -> Optional[torch.Tensor]:
+        cache_key = self._history_norm_cache_key(history_key_norm)
+        entry = cache["keys_by_norm"].get(cache_key)
+        if entry is None:
+            entry = {"norm": history_key_norm, "keys": None}
+            cache["keys_by_norm"][cache_key] = entry
+        if entry["keys"] is None and cache["blocks"]:
+            packed_keys = None
+            for block in cache["blocks"]:
+                stream_value = self._to_stream_tensor(block)
+                key = self._normalize_history_key(stream_value, history_key_norm)
+                packed_keys = self._append_packed_history(packed_keys, key)
+            entry["keys"] = packed_keys
+        return entry["keys"]
 
     @staticmethod
     def _current_value_streams(value: torch.Tensor) -> torch.Tensor:
@@ -1725,9 +1769,16 @@ class DualAttentionResidualBlock(nn.Module):
         state[self._history_key] = blocks
         cache = {
             "blocks": [],
-            "keys": None,
+            "keys_by_norm": {},
             "values": None,
         }
+        for residual_state in (*self.attn_states, *self.mlp_states):
+            history_key_norm = residual_state.history_key_norm
+            cache_key = self._history_norm_cache_key(history_key_norm)
+            cache["keys_by_norm"].setdefault(
+                cache_key,
+                {"norm": history_key_norm, "keys": None},
+            )
         for block in blocks:
             self._append_block(cache, block)
         state[self._cache_key] = cache
@@ -1739,48 +1790,60 @@ class DualAttentionResidualBlock(nn.Module):
             raise ValueError("dual attention residual block history exceeded max_history_len")
         stream_value = self._to_stream_tensor(partial_block)
         cache["blocks"].append(partial_block)
-        if _DUAL_TRITON_HISTORY_APPEND_PACK:
-            try:
-                if triton_dual_history_append_pack is None or not _dual_residual_triton_is_available():
-                    raise RuntimeError("MEGATRON_DUAL_TRITON_HISTORY_APPEND_PACK=1 requires Triton")
-                if cache["keys"] is None:
-                    seq_len, batch_size, _, hidden_size = stream_value.shape
-                    previous_shape = (2, 0, batch_size, seq_len, hidden_size)
-                    previous_keys = torch.empty(
-                        previous_shape,
-                        device=stream_value.device,
-                        dtype=stream_value.dtype,
+        previous_values = cache["values"]
+        new_value = self._history_value(stream_value)
+        next_values = self._append_packed_history(previous_values, new_value)
+        for entry in cache["keys_by_norm"].values():
+            history_key_norm = entry["norm"]
+            if _DUAL_TRITON_HISTORY_APPEND_PACK and isinstance(history_key_norm, FixedRMSNorm):
+                try:
+                    if triton_dual_history_append_pack is None or not _dual_residual_triton_is_available():
+                        raise RuntimeError("MEGATRON_DUAL_TRITON_HISTORY_APPEND_PACK=1 requires Triton")
+                    if entry["keys"] is None:
+                        seq_len, batch_size, _, hidden_size = stream_value.shape
+                        previous_shape = (2, 0, batch_size, seq_len, hidden_size)
+                        previous_keys = torch.empty(
+                            previous_shape,
+                            device=stream_value.device,
+                            dtype=stream_value.dtype,
+                        )
+                        entry_previous_values = torch.empty_like(previous_keys)
+                    else:
+                        previous_keys = entry["keys"]
+                        entry_previous_values = previous_values
+                    entry["keys"], packed_values = triton_dual_history_append_pack(
+                        previous_keys,
+                        entry_previous_values,
+                        stream_value,
+                        history_key_norm.eps,
+                        _DUAL_KV_MODE == "crossk_selfv",
+                        _DUAL_KV_MODE == "selfk_crossv",
                     )
-                    previous_values = torch.empty_like(previous_keys)
-                else:
-                    previous_keys = cache["keys"]
-                    previous_values = cache["values"]
-                cache["keys"], cache["values"] = triton_dual_history_append_pack(
-                    previous_keys,
-                    previous_values,
-                    stream_value,
-                    self.history_key_norm.eps,
-                    _DUAL_KV_MODE == "crossk_selfv",
-                    _DUAL_KV_MODE == "selfk_crossv",
-                )
-                return
-            except (RuntimeError, ValueError):
-                if _DUAL_TRITON_HISTORY_APPEND_PACK_STRICT:
-                    raise
-        cache["keys"] = self._append_packed_history(cache["keys"], self._normalize_history_key(stream_value))
-        cache["values"] = self._append_packed_history(cache["values"], self._history_value(stream_value))
+                    next_values = packed_values
+                    continue
+                except (RuntimeError, ValueError):
+                    if _DUAL_TRITON_HISTORY_APPEND_PACK_STRICT:
+                        raise
+            key = self._normalize_history_key(stream_value, history_key_norm)
+            entry["keys"] = self._append_packed_history(entry["keys"], key)
+        cache["values"] = next_values
 
     def _dual_history_attention(
         self,
         cache: dict,
         partial_block: torch.Tensor,
         query: torch.Tensor,
+        history_key_norm: nn.Module,
         *,
         include_current: bool,
         history_logits: Optional[torch.Tensor] = None,
         history_prefix: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        keys = cache["keys"]
+        keys = (
+            self._history_keys(cache, history_key_norm)
+            if "keys_by_norm" in cache
+            else cache.get("keys")
+        )
         values = cache["values"]
         if keys is None or values is None:
             if include_current:
@@ -1795,9 +1858,9 @@ class DualAttentionResidualBlock(nn.Module):
                 current_value = None
                 current_streams = current
                 current_value_cross = _DUAL_KV_MODE == "selfk_crossv"
-                current_key_streams = self.history_key_norm(current)
+                current_key_streams = history_key_norm(current)
             else:
-                current_key = self._normalize_history_key(current)
+                current_key = self._normalize_history_key(current, history_key_norm)
                 current_value = self._history_value(current)
                 current_streams = None
                 current_key_streams = None
@@ -1828,53 +1891,50 @@ class DualAttentionResidualBlock(nn.Module):
         self,
         attended_streams: torch.Tensor,
         fused_weight: torch.Tensor,
-        static_alpha: nn.Parameter,
-        static_beta: nn.Parameter,
-        static_residual_param: nn.Parameter,
+        residual_state: _DualResidualSublayerState,
     ) -> tuple[torch.Tensor, ...]:
         if _DUAL_DEFER_STREAM_MIX:
             return _dual_scalar_mix_defer_impl(
                 attended_streams,
                 fused_weight,
-                static_alpha,
-                static_beta,
-                static_residual_param,
-                self.pre_branch_scale,
-                self.h_post_scale,
-                self.residual_scale,
-                self.norm.eps,
-                self.norm.force_fp32,
+                residual_state.static_alpha,
+                residual_state.static_beta,
+                residual_state.static_residual_logit,
+                residual_state.pre_branch_scale,
+                residual_state.h_post_scale,
+                residual_state.residual_scale,
+                residual_state.norm.eps,
+                residual_state.norm.force_fp32,
             )
         return _dual_scalar_mix_impl(
             attended_streams,
             fused_weight,
-            static_alpha,
-            static_beta,
-            static_residual_param,
-            self.pre_branch_scale,
-            self.h_post_scale,
-            self.residual_scale,
-            self.norm.eps,
-            self.norm.force_fp32,
+            residual_state.static_alpha,
+            residual_state.static_beta,
+            residual_state.static_residual_logit,
+            residual_state.pre_branch_scale,
+            residual_state.h_post_scale,
+            residual_state.residual_scale,
+            residual_state.norm.eps,
+            residual_state.norm.force_fp32,
         )
 
     def _mix_from_attended_without_keep(
         self,
         attended_streams: torch.Tensor,
         fused_weight: torch.Tensor,
-        static_alpha: nn.Parameter,
-        static_beta: nn.Parameter,
+        residual_state: _DualResidualSublayerState,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None]:
         dynamic_ab_weight = fused_weight[:, : self.num_streams * 2]
         alpha, beta = _dual_stream_alpha_beta_impl(
             attended_streams,
             dynamic_ab_weight,
-            static_alpha,
-            static_beta,
-            self.pre_branch_scale,
-            self.h_post_scale,
-            self.norm.eps,
-            self.norm.force_fp32,
+            residual_state.static_alpha,
+            residual_state.static_beta,
+            residual_state.pre_branch_scale,
+            residual_state.h_post_scale,
+            residual_state.norm.eps,
+            residual_state.norm.force_fp32,
         )
         stream0 = attended_streams[:, :, 0, :]
         stream1 = attended_streams[:, :, 1, :]
@@ -1885,17 +1945,17 @@ class DualAttentionResidualBlock(nn.Module):
         self,
         partial_block: torch.Tensor,
         fused_weight: torch.Tensor,
-        static_residual_param: nn.Parameter,
+        residual_state: _DualResidualSublayerState,
     ) -> torch.Tensor:
         source_streams = self._to_stream_tensor(partial_block)
         residual_weight = fused_weight[:, -1:]
         return _dual_stream_keep_impl(
             source_streams,
             residual_weight,
-            static_residual_param,
-            self.residual_scale,
-            self.norm.eps,
-            self.norm.force_fp32,
+            residual_state.static_residual_logit,
+            residual_state.residual_scale,
+            residual_state.norm.eps,
+            residual_state.norm.force_fp32,
             _DUAL_KEEP_SOURCE == "static",
         )
 
@@ -1903,30 +1963,26 @@ class DualAttentionResidualBlock(nn.Module):
         self,
         partial_block: torch.Tensor,
         fused_weight: torch.Tensor,
-        static_alpha: nn.Parameter,
-        static_beta: nn.Parameter,
+        residual_state: _DualResidualSublayerState,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         source_streams = self._to_stream_tensor(partial_block)
         dynamic_ab_weight = fused_weight[:, : self.num_streams * 2]
         return _dual_stream_alpha_beta_impl(
             source_streams,
             dynamic_ab_weight,
-            static_alpha,
-            static_beta,
-            self.pre_branch_scale,
-            self.h_post_scale,
-            self.norm.eps,
-            self.norm.force_fp32,
+            residual_state.static_alpha,
+            residual_state.static_beta,
+            residual_state.pre_branch_scale,
+            residual_state.h_post_scale,
+            residual_state.norm.eps,
+            residual_state.norm.force_fp32,
         )
 
     def _try_triton_fused_residual_read(
         self,
         partial_block: torch.Tensor,
-        query: torch.Tensor,
         fused_weight: torch.Tensor,
-        static_alpha: nn.Parameter,
-        static_beta: nn.Parameter,
-        static_residual_param: nn.Parameter,
+        residual_state: _DualResidualSublayerState,
         history_prefix: Optional[tuple[torch.Tensor, torch.Tensor]],
         include_current: bool,
     ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
@@ -1988,9 +2044,12 @@ class DualAttentionResidualBlock(nn.Module):
         if _DUAL_TRITON_CURRENT_KEY_NORM:
             if triton_fixed_rms_norm is None:
                 raise RuntimeError("MEGATRON_DUAL_TRITON_CURRENT_KEY_NORM requires Triton")
-            current_key_streams = triton_fixed_rms_norm(current_streams, self.history_key_norm.eps)
+            current_key_streams = triton_fixed_rms_norm(
+                current_streams,
+                residual_state.history_key_norm.eps,
+            )
         else:
-            current_key_streams = self.history_key_norm(current_streams)
+            current_key_streams = residual_state.history_key_norm(current_streams)
         _dual_profile_record("current_prepare", t0)
         t0 = _dual_profile_now()
         try:
@@ -1998,15 +2057,15 @@ class DualAttentionResidualBlock(nn.Module):
                 history_prefix,
                 current_streams,
                 current_key_streams,
-                query,
+                residual_state.q,
                 fused_weight,
-                static_alpha,
-                static_beta,
-                static_residual_param,
-                self.pre_branch_scale,
-                self.h_post_scale,
-                self.residual_scale,
-                self.norm.eps,
+                residual_state.static_alpha,
+                residual_state.static_beta,
+                residual_state.static_residual_logit,
+                residual_state.pre_branch_scale,
+                residual_state.h_post_scale,
+                residual_state.residual_scale,
+                residual_state.norm.eps,
                 cross_key=_DUAL_KV_MODE == "crossk_selfv",
             )
         except Exception as exc:
@@ -2021,9 +2080,9 @@ class DualAttentionResidualBlock(nn.Module):
                     f"partial={tuple(partial_block.shape)} "
                     f"prefix_logit={tuple(history_prefix[0].shape)} "
                     f"prefix_attended={tuple(history_prefix[1].shape)} "
-                    f"query={tuple(query.shape)} fused_weight={tuple(fused_weight.shape)} "
+                    f"query={tuple(residual_state.q.shape)} fused_weight={tuple(fused_weight.shape)} "
                     f"dtypes partial={partial_block.dtype} prefix={history_prefix[1].dtype} "
-                    f"query={query.dtype} fused={fused_weight.dtype}",
+                    f"query={residual_state.q.dtype} fused={fused_weight.dtype}",
                     flush=True,
                 )
                 traceback.print_exc()
@@ -2036,23 +2095,21 @@ class DualAttentionResidualBlock(nn.Module):
         self,
         cache: dict,
         partial_block: torch.Tensor,
-        query: torch.Tensor,
-        fused_weight: torch.Tensor,
-        static_alpha: nn.Parameter,
-        static_beta: nn.Parameter,
-        static_residual_param: nn.Parameter,
+        residual_state: _DualResidualSublayerState,
         include_current: bool = True,
         history_logits: Optional[torch.Tensor] = None,
         history_prefix: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         defer_partial_keep: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         t0 = _dual_profile_now()
-        attention_cache = cache
+        fused_weight = residual_state.fused_weight()
+        history_keys = self._history_keys(cache, residual_state.history_key_norm)
+        attention_cache = {"keys": history_keys, "values": cache["values"]}
         attention_include_current = include_current
         rawless_cache = None
         rawless_include_current = include_current
         if _DUAL_EXCLUDE_RAW_HISTORY or _DUAL_RAWLESS_RESIDUAL:
-            keys = cache["keys"]
+            keys = history_keys
             values = cache["values"]
             if keys is not None and values is not None:
                 rawless_cache = {
@@ -2068,11 +2125,8 @@ class DualAttentionResidualBlock(nn.Module):
             history_prefix = None
         fused = self._try_triton_fused_residual_read(
             partial_block,
-            query,
             fused_weight,
-            static_alpha,
-            static_beta,
-            static_residual_param,
+            residual_state,
             history_prefix,
             attention_include_current,
         )
@@ -2081,7 +2135,8 @@ class DualAttentionResidualBlock(nn.Module):
         attended = self._dual_history_attention(
             attention_cache,
             partial_block,
-            query,
+            residual_state.q,
+            residual_state.history_key_norm,
             include_current=attention_include_current,
             history_logits=history_logits,
             history_prefix=history_prefix,
@@ -2098,20 +2153,21 @@ class DualAttentionResidualBlock(nn.Module):
             mixed = self._mix_from_attended_without_keep(
                 attended,
                 fused_weight,
-                static_alpha,
-                static_beta,
+                residual_state,
             )
         else:
             mixed = self._mix_from_attended(
                 attended,
                 fused_weight,
-                static_alpha,
-                static_beta,
-                static_residual_param,
+                residual_state,
             )
         if _DUAL_DEFER_STREAM_MIX:
             if _DUAL_AB_SOURCE != "attended":
-                alpha, beta = self._alpha_beta_from_partial(partial_block, fused_weight, static_alpha, static_beta)
+                alpha, beta = self._alpha_beta_from_partial(
+                    partial_block,
+                    fused_weight,
+                    residual_state,
+                )
                 attended_stream0 = attended[:, :, 0, :]
                 attended_stream1 = attended[:, :, 1, :]
                 branch_input = alpha[..., :1] * attended_stream0 + alpha[..., 1:] * attended_stream1
@@ -2120,7 +2176,7 @@ class DualAttentionResidualBlock(nn.Module):
                 keep = (
                     None
                     if skip_attended_keep
-                    else self._keep_from_partial(partial_block, fused_weight, static_residual_param)
+                    else self._keep_from_partial(partial_block, fused_weight, residual_state)
                 )
                 mixed = (mixed[0], mixed[1], mixed[2], mixed[3], keep)
         elif _DUAL_AB_SOURCE != "attended" or _DUAL_KEEP_SOURCE != "attended":
@@ -2134,7 +2190,8 @@ class DualAttentionResidualBlock(nn.Module):
             rawless_attended = self._dual_history_attention(
                 rawless_cache,
                 partial_block,
-                query,
+                residual_state.q,
+                residual_state.history_key_norm,
                 include_current=rawless_include_current,
                 history_logits=None,
                 history_prefix=None,
@@ -2151,9 +2208,7 @@ class DualAttentionResidualBlock(nn.Module):
             rawless_mixed = self._mix_from_attended(
                 rawless_attended,
                 fused_weight,
-                static_alpha,
-                static_beta,
-                static_residual_param,
+                residual_state,
             )
             return mixed[0], rawless_mixed[1], rawless_mixed[2], mixed[3]
         return mixed
@@ -2224,17 +2279,17 @@ class DualAttentionResidualBlock(nn.Module):
         self,
         partial_block: torch.Tensor,
         fused_weight: torch.Tensor,
-        static_residual_param: nn.Parameter,
+        residual_state: _DualResidualSublayerState,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         streams = self._to_stream_tensor(partial_block)
         residual_weight = fused_weight[:, -1:]
         return _dual_stream_keep_mix_current_impl(
             streams,
             residual_weight,
-            static_residual_param,
-            self.residual_scale,
-            self.norm.eps,
-            self.norm.force_fp32,
+            residual_state.static_residual_logit,
+            residual_state.residual_scale,
+            residual_state.norm.eps,
+            residual_state.norm.force_fp32,
             _DUAL_KEEP_SOURCE == "static",
         )
 
@@ -2277,8 +2332,6 @@ class DualAttentionResidualBlock(nn.Module):
             and not bool(cache["blocks"])
             and not bool(state.get(self._embed_as_partial_consumed_key, False))
         )
-        attn_fused_weight = torch.cat((self.attn_dynamic_ab_fn, self.attn_dynamic_residual_mix_fn), dim=-1)
-        mlp_fused_weight = torch.cat((self.mlp_dynamic_ab_fn, self.mlp_dynamic_residual_mix_fn), dim=-1)
         history_logits_cache: dict[tuple[int, str], torch.Tensor] = {}
         history_prefix_cache: dict[
             tuple[int, str], Optional[tuple[torch.Tensor, torch.Tensor]]
@@ -2287,39 +2340,51 @@ class DualAttentionResidualBlock(nn.Module):
         def get_history_prefix(
             layer_index: int,
             name: str,
-            query: torch.Tensor,
+            residual_state: _DualResidualSublayerState,
             include_current: bool,
         ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-            keys = cache["keys"]
+            if not _DUAL_CACHE_HISTORY_PREFIX:
+                return None
+            keys = self._history_keys(cache, residual_state.history_key_norm)
             values = cache["values"]
-            if not _DUAL_CACHE_HISTORY_PREFIX or keys is None or values is None:
+            if keys is None or values is None:
                 return None
             if not include_current and int(keys.shape[1]) == 1:
                 return None
             cache_key = (layer_index, name)
             if cache_key in history_prefix_cache:
                 return history_prefix_cache[cache_key]
-            if _DUAL_CACHE_HISTORY_PREFIX_PAIR:
+            attn_history_norm = self.attn_states[layer_index].history_key_norm
+            mlp_history_norm = self.mlp_states[layer_index].history_key_norm
+            pair_has_equivalent_norms = (
+                self._history_norm_cache_key(attn_history_norm)
+                == self._history_norm_cache_key(mlp_history_norm)
+            )
+            if _DUAL_CACHE_HISTORY_PREFIX_PAIR and pair_has_equivalent_norms:
                 t0 = _dual_profile_now()
                 attn_prefix, mlp_prefix = _dual_history_prefix_pair(
                     keys,
                     values.to(dtype=keys.dtype),
-                    self.attn_qs[layer_index],
-                    self.mlp_qs[layer_index],
+                    self.attn_states[layer_index].q,
+                    self.mlp_states[layer_index].q,
                     history_blocks=(
                         cache["blocks"]
                         if _DUAL_RECOMPUTE_HISTORY_VALUES or _DUAL_RECOMPUTE_HISTORY_KEYS
                         else None
                     ),
-                    history_norm_eps=self.history_key_norm.eps,
-                    history_norm_fp32=self.history_key_norm.force_fp32,
+                    history_norm_eps=residual_state.history_key_norm.eps,
+                    history_norm_fp32=residual_state.history_key_norm.force_fp32,
                 )
                 _dual_profile_record("history_prefix_pair_precompute", t0)
                 history_prefix_cache[(layer_index, "attn")] = attn_prefix
                 history_prefix_cache[(layer_index, "mlp")] = mlp_prefix
                 return history_prefix_cache[cache_key]
             t0 = _dual_profile_now()
-            prefix = _dual_history_prefix(keys, values.to(dtype=keys.dtype), query)
+            prefix = _dual_history_prefix(
+                keys,
+                values.to(dtype=keys.dtype),
+                residual_state.q,
+            )
             _dual_profile_record("history_prefix_precompute", t0)
             history_prefix_cache[cache_key] = prefix
             return prefix
@@ -2327,11 +2392,13 @@ class DualAttentionResidualBlock(nn.Module):
         def get_history_logits(
             layer_index: int,
             name: str,
-            query: torch.Tensor,
+            residual_state: _DualResidualSublayerState,
             include_current: bool,
         ) -> Optional[torch.Tensor]:
-            keys = cache["keys"]
-            if _DUAL_CACHE_HISTORY_PREFIX or not _DUAL_CACHE_HISTORY_LOGITS or keys is None:
+            if _DUAL_CACHE_HISTORY_PREFIX or not _DUAL_CACHE_HISTORY_LOGITS:
+                return None
+            keys = self._history_keys(cache, residual_state.history_key_norm)
+            if keys is None:
                 return None
             if not include_current and int(keys.shape[1]) == 1:
                 return None
@@ -2340,14 +2407,16 @@ class DualAttentionResidualBlock(nn.Module):
             if cached is not None and int(cached.shape[1]) == int(keys.shape[1]):
                 return cached
             t0 = _dual_profile_now()
-            logits = _dual_history_logits(keys, query.to(dtype=keys.dtype))
+            logits = _dual_history_logits(keys, residual_state.q.to(dtype=keys.dtype))
             _dual_profile_record("history_logits_precompute", t0)
             history_logits_cache[cache_key] = logits
             return logits
 
         for layer_index, layer in enumerate(self.layers):
-            attn_q = self.attn_qs[layer_index]
-            mlp_q = self.mlp_qs[layer_index]
+            attn_state = self.attn_states[layer_index]
+            mlp_state = self.mlp_states[layer_index]
+            attn_fused_weight = attn_state.fused_weight()
+            mlp_fused_weight = mlp_state.fused_weight()
             current_is_already_in_history = history_includes_current_input or (
                 bool(cache["blocks"]) and cache["blocks"][-1] is partial_block
             )
@@ -2363,7 +2432,7 @@ class DualAttentionResidualBlock(nn.Module):
             attn_history_prefix = get_history_prefix(
                 layer_index,
                 "attn",
-                attn_q,
+                attn_state,
                 include_current,
             )
             first_attn_in_block = not block_started
@@ -2371,16 +2440,12 @@ class DualAttentionResidualBlock(nn.Module):
             attn_mix = self._dual_block_attn_res(
                 cache,
                 partial_block,
-                attn_q,
-                attn_fused_weight,
-                self.attn_static_alpha,
-                self.attn_static_beta,
-                self.attn_static_residual_logit,
+                attn_state,
                 include_current=include_current,
                 history_logits=get_history_logits(
                     layer_index,
                     "attn",
-                    attn_q,
+                    attn_state,
                     include_current,
                 ),
                 history_prefix=attn_history_prefix,
@@ -2434,7 +2499,7 @@ class DualAttentionResidualBlock(nn.Module):
                         attn_keep = self._keep_from_partial(
                             partial_block,
                             attn_fused_weight,
-                            self.attn_static_residual_logit,
+                            attn_state,
                         )
                     partial_block = self._merge_delta_deferred(
                         attn_residual0,
@@ -2484,7 +2549,7 @@ class DualAttentionResidualBlock(nn.Module):
                         current_residual0, current_residual1, attn_keep = self._mix_current_residual_from_partial(
                             partial_block,
                             attn_fused_weight,
-                            self.attn_static_residual_logit,
+                            attn_state,
                         )
                     else:
                         current_residual0, current_residual1 = self._mix_current_residual(partial_block, attn_keep)
@@ -2520,16 +2585,12 @@ class DualAttentionResidualBlock(nn.Module):
             _dual_profile_record("attn_merge", t0)
 
             t0 = _dual_profile_now()
-            mlp_history_prefix = get_history_prefix(layer_index, "mlp", mlp_q, True)
+            mlp_history_prefix = get_history_prefix(layer_index, "mlp", mlp_state, True)
             mlp_mix = self._dual_block_attn_res(
                 cache,
                 partial_block,
-                mlp_q,
-                mlp_fused_weight,
-                self.mlp_static_alpha,
-                self.mlp_static_beta,
-                self.mlp_static_residual_logit,
-                history_logits=get_history_logits(layer_index, "mlp", mlp_q, True),
+                mlp_state,
+                history_logits=get_history_logits(layer_index, "mlp", mlp_state, True),
                 history_prefix=mlp_history_prefix,
                 defer_partial_keep=_DUAL_DEFER_PARTIAL_KEEP_MIX,
             )
@@ -2558,7 +2619,7 @@ class DualAttentionResidualBlock(nn.Module):
                         mlp_keep = self._keep_from_partial(
                             partial_block,
                             mlp_fused_weight,
-                            self.mlp_static_residual_logit,
+                            mlp_state,
                         )
                     partial_block = self._merge_delta_deferred(
                         mlp_residual0,
@@ -2591,7 +2652,7 @@ class DualAttentionResidualBlock(nn.Module):
                     current_residual0, current_residual1, mlp_keep = self._mix_current_residual_from_partial(
                         partial_block,
                         mlp_fused_weight,
-                        self.mlp_static_residual_logit,
+                        mlp_state,
                     )
                 else:
                     current_residual0, current_residual1 = self._mix_current_residual(partial_block, mlp_keep)
@@ -2668,18 +2729,24 @@ class DualAttentionResidualOutputAggregation(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         blocks = self._history_blocks(state)
         cache = state.get(self._cache_key)
+        cached_keys = None
+        if cache is not None:
+            cache_key = _dual_history_norm_cache_key(self.history_key_norm)
+            cache_entry = cache.get("keys_by_norm", {}).get(cache_key)
+            if cache_entry is not None:
+                cached_keys = cache_entry.get("keys")
         if (
             cache is not None
-            and cache.get("keys") is not None
+            and cached_keys is not None
             and cache.get("values") is not None
-            and int(cache["keys"].shape[1]) == len(blocks)
+            and int(cached_keys.shape[1]) == len(blocks)
         ):
             # Normally the block cache stores [raw_input, block1_input, ...],
             # and final aggregation drops raw_input.  In embed-as-partial mode,
             # raw_input was never cached, so keep every completed block.
             first_history_index = 0 if _DUAL_EMBED_AS_PARTIAL else 1
             return (
-                cache["keys"][:, first_history_index:],
+                cached_keys[:, first_history_index:],
                 cache["values"][:, first_history_index:],
                 *self._pack(hidden_states),
             )
