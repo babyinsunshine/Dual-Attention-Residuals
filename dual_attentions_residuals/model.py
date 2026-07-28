@@ -333,20 +333,11 @@ class MCoreAtomicLayer(nn.Module):
         return hidden_states
 
     def attention_delta(self, hidden_states: torch.Tensor, *, attention_mask=None, rotary_pos_emb=None) -> torch.Tensor:
-        self.last_aux_loss = None
-        hidden_states, original_shape = self._to_sequence_batch(hidden_states)
-        if hasattr(self.layer, "_forward_attention"):
-            out = call_with_supported_kwargs(
-                self.layer._forward_attention,
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                inference_context=None,
-                packed_seq_params=None,
-            )
-            return self._restore_shape(first_tensor(out) - hidden_states, original_shape)
-        out = self.layer(hidden_states, attention_mask=attention_mask, rotary_pos_emb=rotary_pos_emb)
-        return self._restore_shape(first_tensor(out) - hidden_states, original_shape)
+        return self.attention_raw_output(
+            hidden_states,
+            attention_mask=attention_mask,
+            rotary_pos_emb=rotary_pos_emb,
+        )
 
     def attention_raw_output(
         self,
