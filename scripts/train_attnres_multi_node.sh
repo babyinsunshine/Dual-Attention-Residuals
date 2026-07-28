@@ -6,6 +6,9 @@ set -euo pipefail
 MASTER_PORT="${MASTER_PORT:-29500}"
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
+source "$ROOT/scripts/attnres_kernel_mode.sh"
+configure_attnres_kernel_mode
+echo "ATTRES_KERNEL_MODE=$ATTRES_KERNEL_MODE"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
