@@ -1365,18 +1365,35 @@ def maybe_save_checkpoint(
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
     ckpt_dir = Path(path) / f"iter_{step:07d}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    module = unwrap_model(model)
-    payload = {
-        "model": module.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "lr_scheduler": lr_scheduler.state_dict() if lr_scheduler is not None else None,
-        "step": step,
-        "rank": rank,
-        "world_size": world_size,
-        "rng_state": torch.get_rng_state(),
-        "cuda_rng_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-    }
-    torch.save(payload, ckpt_dir / f"rank_{rank:05d}.pt")
+    overlap_ddp = getattr(model, "ddp", None)
+    restore_forward_pre_hook = bool(
+        overlap_ddp is not None
+        and getattr(overlap_ddp, "use_forward_hook", False)
+        and hasattr(overlap_ddp, "disable_forward_pre_hook")
+        and hasattr(overlap_ddp, "enable_forward_pre_hook")
+    )
+    if restore_forward_pre_hook:
+        overlap_ddp.disable_forward_pre_hook(param_sync=True)
+    try:
+        module = unwrap_model(model)
+        payload = {
+            "model": module.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "lr_scheduler": lr_scheduler.state_dict() if lr_scheduler is not None else None,
+            "step": step,
+            "rank": rank,
+            "world_size": world_size,
+            "rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+        }
+        torch.save(payload, ckpt_dir / f"rank_{rank:05d}.pt")
+        if hasattr(optimizer, "save_parameter_state"):
+            optimizer.save_parameter_state(
+                str(ckpt_dir / f"optimizer_parameter_state_rank_{rank:05d}.pt")
+            )
+    finally:
+        if restore_forward_pre_hook:
+            overlap_ddp.enable_forward_pre_hook()
     if rank == 0:
         latest_tmp = Path(path) / "latest.tmp"
         latest_tmp.write_text(ckpt_dir.name + "\n", encoding="utf-8")
@@ -1461,6 +1478,10 @@ def load_checkpoint(
     load_optimizer = env_bool("MEGATRON_LOAD_OPTIMIZER", True)
     if load_optimizer and "optimizer" in checkpoint and checkpoint["optimizer"] is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])
+        if hasattr(optimizer, "load_parameter_state"):
+            optimizer.load_parameter_state(
+                str(ckpt_file.parent / f"optimizer_parameter_state_rank_{rank:05d}.pt")
+            )
         startup_log(f"checkpoint optimizer loaded {cuda_memory_text()}", all_ranks=True)
     elif not load_optimizer:
         startup_log("checkpoint optimizer load skipped by MEGATRON_LOAD_OPTIMIZER=0", all_ranks=True)
