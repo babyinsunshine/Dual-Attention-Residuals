@@ -723,6 +723,11 @@ def _dual_attend_from_history_prefix(
     return attended if output_dtype is None else attended.to(dtype=output_dtype)
 
 
+def _with_zero_query_dependency(output: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+    """Keep a paper-inactive singleton query visible to grad-ready hooks."""
+    return output + query.sum().to(dtype=output.dtype) * 0.0
+
+
 def _dual_depth_attention_eager(
     keys: torch.Tensor,
     values: torch.Tensor,
@@ -746,7 +751,7 @@ def _dual_depth_attention_eager(
         # A one-entry history makes the softmax independent of q.  Keep an
         # exact zero dependency so Megatron's overlap-grad bucket still sees
         # this replicated parameter become ready on the first global branch.
-        attended = attended + query.sum().to(dtype=attended.dtype) * 0.0
+        attended = _with_zero_query_dependency(attended, query)
         return attended if output_dtype is None else attended.to(dtype=output_dtype)
     if history_prefix is not None:
         if has_current_key_streams:
@@ -755,6 +760,7 @@ def _dual_depth_attention_eager(
             if keys.shape[1] == 0:
                 if current_value_cross:
                     current_streams = torch.stack((current_streams[:, :, 1, :], current_streams[:, :, 0, :]), dim=2)
+                current_streams = _with_zero_query_dependency(current_streams, query)
                 return current_streams if output_dtype is None else current_streams.to(dtype=output_dtype)
             current_logits = _dual_current_logits_from_key_streams(current_key_streams, query)
             current_value_sbdh = current_streams
@@ -762,6 +768,7 @@ def _dual_depth_attention_eager(
             current_key = current_key.to(dtype=keys.dtype)
             if keys.shape[1] == 0:
                 attended = current_value.to(dtype=keys.dtype).permute(2, 1, 0, 3)
+                attended = _with_zero_query_dependency(attended, query)
                 return attended if output_dtype is None else attended.to(dtype=output_dtype)
             current_logits = _dual_current_logits(current_key, query)
             current_value_sbdh = current_value.to(dtype=keys.dtype).permute(2, 1, 0, 3)
@@ -787,12 +794,14 @@ def _dual_depth_attention_eager(
         if keys.shape[1] == 0:
             if current_value_cross:
                 current_streams = torch.stack((current_streams[:, :, 1, :], current_streams[:, :, 0, :]), dim=2)
+            current_streams = _with_zero_query_dependency(current_streams, query)
             return current_streams if output_dtype is None else current_streams.to(dtype=output_dtype)
         current_logits = _dual_current_logits_from_key_streams(current_key_streams, query)
     else:
         current_key = current_key.to(dtype=keys.dtype)
         if keys.shape[1] == 0:
             attended = current_value.to(dtype=keys.dtype).permute(2, 1, 0, 3)
+            attended = _with_zero_query_dependency(attended, query)
             return attended if output_dtype is None else attended.to(dtype=output_dtype)
         current_logits = _dual_current_logits(current_key, query)
     if not _DUAL_SPLIT_CURRENT_SOFTMAX:
@@ -1668,8 +1677,11 @@ class DualAttentionResidualBlock(nn.Module):
     def __init__(self, config, layers: list[nn.Module], layer_index: int) -> None:
         super().__init__()
         self.full_history = str(config.model.variant).lower() == "dual_attention_residual"
-        if self.full_history and len(layers) != 1:
-            raise ValueError("dual_attention_residual full mode requires one Transformer layer per residual block")
+        if self.full_history:
+            raise ValueError(
+                "dual_attention_residual is unsupported; use dual_attention_residual_block "
+                "with hyper_conn_block_layers=1 for paper K=1 semantics"
+            )
         self.layers = nn.ModuleList(layers)
         self.last_aux_loss: Optional[torch.Tensor] = None
         self.num_streams = 2
@@ -1851,7 +1863,8 @@ class DualAttentionResidualBlock(nn.Module):
         values = cache["values"]
         if keys is None or values is None:
             if include_current:
-                return self._current_value_streams(self._to_stream_tensor(partial_block))
+                current = self._current_value_streams(self._to_stream_tensor(partial_block))
+                return _with_zero_query_dependency(current, query)
             raise ValueError("dual attention residual block requires at least one cached history block")
         current_value_cross = False
         if include_current:

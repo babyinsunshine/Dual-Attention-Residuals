@@ -79,8 +79,10 @@ Tests must establish all of the following:
 - Query objects and storage are distinct between atomic layers.
 - Each sublayer receives its matching query during forward execution.
 - Query-dependent history caches do not cross layer boundaries.
-- Every per-layer query receives a finite, nonzero gradient in a representative
-  backward pass.
+- Every per-layer query receives a finite gradient and fires its grad-ready hook
+  in a representative backward pass. A singleton retrieval is mathematically
+  query-independent, so its retained dependency must produce an exact-zero
+  gradient rather than a missing gradient.
 - Query parameters retain sequence-parallel synchronization metadata.
 - All Dual residual-state parameter and norm objects are distinct across the
   six atomic sublayers in a three-layer block.

@@ -528,6 +528,73 @@ class PerLayerResidualQueryForwardTests(unittest.TestCase):
 
         self.assertTrue(torch.equal(packed_keys[:, 0], expected_completed_key))
 
+    def test_dual_single_block_output_query_is_grad_ready(self) -> None:
+        config = make_config("dual_attention_residual_block")
+        config.model.num_layers = 1
+        config.model.hyper_conn_block_layers = 1
+        aggregation = rb.DualAttentionResidualOutputAggregation(config)
+        aggregation.history_key_norm = IdentityNorm()
+        raw = torch.randn(2, 2, 8)
+        final_hidden = torch.randn(2, 2, 8, requires_grad=True)
+        raw_keys, raw_values = aggregation._pack(raw)
+        cache_key = rb._dual_history_norm_cache_key(aggregation.history_key_norm)
+        state = {
+            "history": [raw],
+            "history_cache": {
+                "keys_by_norm": {
+                    cache_key: {"keys": raw_keys.unsqueeze(1)},
+                },
+                "values": raw_values.unsqueeze(1),
+            },
+        }
+        hook_count = 0
+
+        def count_hook(gradient: torch.Tensor) -> torch.Tensor:
+            nonlocal hook_count
+            hook_count += 1
+            return gradient
+
+        handle = aggregation.q.register_hook(count_hook)
+        try:
+            output = aggregation(final_hidden, state)
+            self.assertTrue(torch.equal(output, final_hidden))
+            output.sum().backward()
+        finally:
+            handle.remove()
+
+        self.assertEqual(hook_count, 1)
+        self.assertIsNotNone(aggregation.q.grad)
+        self.assertEqual(torch.count_nonzero(aggregation.q.grad).item(), 0)
+
+    def test_dual_current_only_residual_query_is_grad_ready(self) -> None:
+        block = rb.DualAttentionResidualBlock(
+            make_config("dual_attention_residual_block"),
+            make_layers(),
+            layer_index=0,
+        )
+        partial = torch.randn(2, 2, 8, requires_grad=True)
+        query = block.attn_states[0].q
+        output = block._dual_history_attention(
+            {"keys": None, "values": None},
+            partial,
+            query,
+            block.attn_states[0].history_key_norm,
+            include_current=True,
+        )
+        self.assertTrue(torch.equal(output, block._to_stream_tensor(partial)))
+        output.sum().backward()
+
+        self.assertIsNotNone(query.grad)
+        self.assertEqual(torch.count_nonzero(query.grad).item(), 0)
+
+    def test_dual_internal_full_history_variant_fails_closed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            rb.DualAttentionResidualBlock(
+                make_config("dual_attention_residual"),
+                make_layers(count=1),
+                layer_index=0,
+            )
+
     def test_dual_embed_as_partial_initializes_empty_triton_append_inputs(self) -> None:
         block = rb.DualAttentionResidualBlock(
             make_config("dual_attention_residual_block"),

@@ -407,7 +407,10 @@ def build_megatron_optimizer(model: torch.nn.Module, cfg):
         get_megatron_optimizer,
         config=optim_config,
         model_chunks=[optimizer_chunk],
-        use_gloo_process_groups=False,
+        # Distributed optimizer checkpoint consolidation uses the DP Gloo
+        # group in Megatron-Core 0.16.  Disabling it lets training run but
+        # fails on the first checkpoint with data_parallel_group_gloo=None.
+        use_gloo_process_groups=True,
     )
     setattr(optimizer, "_dar_mcore_optimizer", True)
     return optimizer
