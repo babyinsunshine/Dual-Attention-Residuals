@@ -2,6 +2,7 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 export MODEL_NAME=attnres
+export ATTRES_KERNEL_MODE=${ATTRES_KERNEL_MODE:-fused}
 export HOSTFILE=${HOSTFILE:-$ROOT/hostfile_attnres}
 export MODEL_LAUNCHER=$ROOT/scripts/train_attnres_multi_node.sh
 export CONFIG_FILE=$ROOT/configs/7b_moe_attnres.yaml

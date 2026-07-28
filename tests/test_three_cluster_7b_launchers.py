@@ -63,11 +63,12 @@ elif [[ $* == *'import torch; import megatron.core'* ]]; then
   fi
 elif [[ ${1:-} == -m && ${2:-} == torch.distributed.run ]]; then
   if [[ -n ${FAKE_PYTHON_LOG:-} ]]; then
-    printf 'launch\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \
+    printf 'launch\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \
       "${MEGATRON_LR_WARMUP_ITERS:-missing}" \
       "${MEGATRON_LR_DECAY_ITERS:-missing}" \
       "${MEGATRON_LOAD_CHECKPOINT:-missing}" \
       "${MEGATRON_RESUME_FROM:-missing}" "${DRY_RUN:-missing}" "$*" \
+      "${ATTRES_KERNEL_MODE:-missing}" \
       >> "$FAKE_PYTHON_LOG"
   fi
   if [[ -n ${FAKE_REMOTE_PIDS:-} ]]; then
@@ -148,6 +149,7 @@ elif [[ $mode == terminate ]]; then
   [[ ${FAKE_SSH_FAIL_TERMINATE_HOST:-} != "$host" ]] || exit 24
 fi
 if [[ ${FAKE_SSH_EXEC_REMOTE:-0} == 1 ]]; then
+  unset ATTRES_KERNEL_MODE
   bash -c "$remote_command" < "$remote_script"
   exit $?
 fi
@@ -372,6 +374,68 @@ sleep 0.8
                     str(REPOSITORY / hostfile_name),
                     completed.stderr,
                 )
+
+    def test_attnres_kernel_mode_contract(self) -> None:
+        for requested in (None, "reference"):
+            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as tmp:
+                env, _hostfile, fake_calls, _log_dir, _pid_file = self.make_runtime(
+                    Path(tmp), "train_7b_attnres_4node.sh"
+                )
+                env["DRY_RUN"] = "1"
+                if requested is None:
+                    env.pop("ATTRES_KERNEL_MODE", None)
+                    expected = "fused"
+                else:
+                    env["ATTRES_KERNEL_MODE"] = requested
+                    expected = requested
+
+                completed = self.run_entry("train_7b_attnres_4node.sh", env)
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn(f"ATTRES_KERNEL_MODE={expected}", completed.stdout)
+                self.assertFalse(fake_calls.exists())
+
+    def test_attnres_kernel_mode_reaches_every_remote_rank(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, _hostfile, _fake_calls, _log_dir, _pid_file = self.make_runtime(
+                root, "train_7b_attnres_4node.sh"
+            )
+            python_log = root / "python-launches.log"
+            env.update(
+                {
+                    "ATTRES_KERNEL_MODE": "reference",
+                    "FAKE_SSH_EXEC_REMOTE": "1",
+                    "FAKE_PYTHON_LOG": str(python_log),
+                    "TRAIN_ITERS": "1",
+                    "WARMUP_ITERS": "0",
+                }
+            )
+
+            completed = self.run_entry(
+                "train_7b_attnres_4node.sh", env, "__controller"
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            launches = [line.split("\t") for line in python_log.read_text().splitlines()]
+            self.assertEqual(len(launches), 4)
+            self.assertEqual([line[7] for line in launches], ["reference"] * 4)
+
+    def test_attnres_kernel_mode_rejects_invalid_value_before_ssh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _hostfile, fake_calls, _log_dir, _pid_file = self.make_runtime(
+                Path(tmp), "train_7b_attnres_4node.sh"
+            )
+            env.update({"ATTRES_KERNEL_MODE": "typo", "DRY_RUN": "1"})
+
+            completed = self.run_entry("train_7b_attnres_4node.sh", env)
+
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn(
+                "ATTRES_KERNEL_MODE must be fused or reference, got: typo",
+                completed.stderr,
+            )
+            self.assertFalse(fake_calls.exists())
 
     def test_hostfile_requires_exactly_four_unique_single_token_hosts(self) -> None:
         invalid_cases = {

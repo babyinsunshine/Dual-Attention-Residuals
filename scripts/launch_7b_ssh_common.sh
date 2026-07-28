@@ -133,6 +133,7 @@ WARMUP_ITERS=${WARMUP_ITERS:-2000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-10000}
 EVAL_INTERVAL=${EVAL_INTERVAL:-10000}
 EVAL_ITERS=${EVAL_ITERS:-20}
+ATTRES_KERNEL_MODE=${ATTRES_KERNEL_MODE:-fused}
 SSH_BIN=${SSH_BIN:-ssh}
 SSH_CONNECT_TIMEOUT=${SSH_CONNECT_TIMEOUT:-10}
 STARTUP_TIMEOUT=${STARTUP_TIMEOUT:-30}
@@ -172,6 +173,10 @@ validate_configuration() {
   (( WARMUP_ITERS < TRAIN_ITERS )) || \
     die "WARMUP_ITERS must satisfy 0 <= WARMUP_ITERS < TRAIN_ITERS"
   [[ $DRY_RUN == 0 || $DRY_RUN == 1 ]] || die "DRY_RUN must be 0 or 1"
+  if [[ $MODEL_NAME == attnres ]]; then
+    [[ $ATTRES_KERNEL_MODE == fused || $ATTRES_KERNEL_MODE == reference ]] ||
+      die "ATTRES_KERNEL_MODE must be fused or reference, got: $ATTRES_KERNEL_MODE"
+  fi
   (( GLOBAL_BATCH_SIZE % (MICRO_BATCH_SIZE * 16) == 0 )) || \
     die "GLOBAL_BATCH_SIZE must be divisible by MICRO_BATCH_SIZE * 16"
 
@@ -221,6 +226,9 @@ print_contract() {
   echo "SAVE_INTERVAL=$SAVE_INTERVAL"
   echo "EVAL_INTERVAL=$EVAL_INTERVAL"
   echo "EVAL_ITERS=$EVAL_ITERS"
+  if [[ $MODEL_NAME == attnres ]]; then
+    echo "ATTRES_KERNEL_MODE=$ATTRES_KERNEL_MODE"
+  fi
   echo "MEGATRON_FORCE_UNIFORM_MOE_ROUTING=0"
 }
 
@@ -422,6 +430,7 @@ eval_iters=$2
 cuda_home=$3
 state_file=$4
 owner=$5
+attres_kernel_mode=$6
 
 [[ $owner =~ ^[a-zA-Z0-9._-]+$ ]] || { echo "invalid remote owner token" >&2; exit 2; }
 [[ ! -e $state_file ]] || { echo "remote state already exists: $state_file" >&2; exit 2; }
@@ -458,6 +467,7 @@ setsid env \
   EVAL_INTERVAL="$eval_interval" \
   EVAL_ITERS="$eval_iters" \
   MODEL_NAME="$model_name" \
+  ATTRES_KERNEL_MODE="$attres_kernel_mode" \
   "$model_launcher" &
 job_pid=$!
 ownership_verified=0
@@ -577,7 +587,8 @@ run_controller() {
       "$MODEL_NAME" "$rank" 4 "$MASTER_ADDR" "$MASTER_PORT" "$GPUS_PER_NODE" \
       "$TRAIN_ITERS" "$MICRO_BATCH_SIZE" "$GLOBAL_BATCH_SIZE" "$WARMUP_ITERS" \
       "$SAVE_INTERVAL" "$EVAL_INTERVAL" "$EVAL_ITERS" "$CUDA_HOME" \
-      "${REMOTE_STATE_FILES[$rank]}" "${REMOTE_OWNERS[$rank]}")
+      "${REMOTE_STATE_FILES[$rank]}" "${REMOTE_OWNERS[$rank]}" \
+      "$ATTRES_KERNEL_MODE")
     echo "starting node rank $rank on $host; log=$node_log"
     "$SSH_BIN" \
       -o BatchMode=yes \
