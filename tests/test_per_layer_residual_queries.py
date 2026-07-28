@@ -286,6 +286,82 @@ class PerLayerResidualQueryForwardTests(unittest.TestCase):
         parameters = [parameter for residual_state in expected for parameter in residual_state.parameters()]
         self.assert_all_nonzero_finite_gradients(parameters)
 
+    def test_dual_paper_first_branch_marks_every_parameter_grad_ready_each_iteration(self) -> None:
+        block = rb.DualAttentionResidualBlock(
+            make_config("dual_attention_residual_block"),
+            make_layers(),
+            layer_index=0,
+        )
+        hook_counts = {name: 0 for name, _ in block.named_parameters()}
+        handles = []
+        for name, parameter in block.named_parameters():
+            handles.append(
+                parameter.register_hook(
+                    lambda _grad, parameter_name=name: hook_counts.__setitem__(
+                        parameter_name,
+                        hook_counts[parameter_name] + 1,
+                    )
+                )
+            )
+
+        def rms_norm(
+            hidden_states: torch.Tensor,
+            normalized_shape,
+            weight=None,
+            eps=None,
+        ) -> torch.Tensor:
+            del normalized_shape
+            normalized = hidden_states * torch.rsqrt(
+                hidden_states.square().mean(dim=-1, keepdim=True)
+                + float(1.0e-5 if eps is None else eps)
+            )
+            return normalized if weight is None else normalized * weight
+
+        try:
+            with mock.patch.object(rb.F, "rms_norm", create=True, side_effect=rms_norm), mock.patch.multiple(
+                rb,
+                _DUAL_TRITON_HISTORY_APPEND_PACK=False,
+                _DUAL_CACHE_HISTORY_PREFIX=False,
+                _DUAL_CACHE_HISTORY_PREFIX_PAIR=False,
+                _DUAL_CACHE_HISTORY_LOGITS=False,
+                _DUAL_TRITON_CURRENT_KEY_NORM=False,
+                _DUAL_TRITON_FUSED_RESIDUAL_READ=False,
+                _DUAL_TE_ATTENTION_EPILOGUE=False,
+                _RESIDUAL_TE_ATTENTION_EPILOGUE=False,
+                _DUAL_DEFER_STREAM_MIX=True,
+                _DUAL_CURRENT_PARTIAL_RESIDUAL=True,
+                _DUAL_AB_SOURCE="attended",
+                _DUAL_KEEP_SOURCE="partial",
+                _DUAL_FUSE_PARTIAL_KEEP_MIX=True,
+                _DUAL_ATTRES_LIMIT=False,
+                _DUAL_ATTRES_LIKE_FIRST_ATTN=False,
+                _DUAL_EXCLUDE_RAW_HISTORY=False,
+                _DUAL_RAWLESS_RESIDUAL=False,
+                _DUAL_EMBED_AS_PARTIAL=False,
+            ):
+                for _ in range(2):
+                    block.zero_grad(set_to_none=True)
+                    output = block(torch.randn(2, 2, 8), state={})
+                    output.float().sum().backward()
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        missing_hooks = {
+            name: count
+            for name, count in hook_counts.items()
+            if count != 2
+        }
+        self.assertEqual(missing_hooks, {})
+        first_attention_state = block.attn_states[0]
+        for parameter in (
+            first_attention_state.dynamic_residual_mix_fn,
+            first_attention_state.static_residual_logit,
+            first_attention_state.residual_scale,
+        ):
+            self.assertIsNotNone(parameter.grad)
+            self.assertEqual(torch.count_nonzero(parameter.grad).item(), 0)
+
     def test_dual_paired_prefix_is_computed_once_per_atomic_layer(self) -> None:
         block = rb.DualAttentionResidualBlock(
             make_config("dual_attention_residual_block"),

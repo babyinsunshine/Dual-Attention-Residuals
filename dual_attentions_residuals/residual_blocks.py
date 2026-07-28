@@ -743,6 +743,10 @@ def _dual_depth_attention_eager(
     has_current_key_streams = current_key_streams is not None
     if current_key is None and current_value is None and not has_current_streams and not has_current_key_streams and keys.shape[1] == 1:
         attended = values[:, 0].permute(2, 1, 0, 3).contiguous()
+        # A one-entry history makes the softmax independent of q.  Keep an
+        # exact zero dependency so Megatron's overlap-grad bucket still sees
+        # this replicated parameter become ready on the first global branch.
+        attended = attended + query.sum().to(dtype=attended.dtype) * 0.0
         return attended if output_dtype is None else attended.to(dtype=output_dtype)
     if history_prefix is not None:
         if has_current_key_streams:
@@ -2537,6 +2541,16 @@ class DualAttentionResidualBlock(nn.Module):
                             has_residual=False,
                         )
                         partial_block = self._from_stream_tensor(merged)
+                    # Equation (15) intentionally omits rho for the first
+                    # branch.  These zero dependencies preserve that exact
+                    # forward while satisfying Megatron DDP's requirement
+                    # that every bucket parameter fire a grad-ready hook.
+                    partial_block = partial_block + self._zero_dependency(
+                        partial_block,
+                        attn_state.dynamic_residual_mix_fn,
+                        attn_state.static_residual_logit,
+                        attn_state.residual_scale,
+                    )
                 else:
                     if attn_current_residual_ready:
                         current_residual0, current_residual1 = attn_residual0, attn_residual1
