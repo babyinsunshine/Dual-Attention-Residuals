@@ -1141,8 +1141,15 @@ class AttentionResidualBlock(nn.Module):
         self.last_aux_loss: Optional[torch.Tensor] = None
         self.attn_res_norm = FixedRMSNorm(config.model.layernorm_epsilon)
         self.mlp_res_norm = FixedRMSNorm(config.model.layernorm_epsilon)
-        self.attn_res_proj = nn.Linear(config.model.hidden_size, 1, bias=False)
-        self.mlp_res_proj = nn.Linear(config.model.hidden_size, 1, bias=False)
+        param_dtype = _train_param_dtype(config)
+        self.attn_qs = nn.ParameterList(
+            nn.Parameter(torch.zeros(config.model.hidden_size, dtype=param_dtype))
+            for _ in self.layers
+        )
+        self.mlp_qs = nn.ParameterList(
+            nn.Parameter(torch.zeros(config.model.hidden_size, dtype=param_dtype))
+            for _ in self.layers
+        )
         self.use_separate_k_proj = bool(config.model.hyper_conn_attres_separate_k_proj)
         if self.use_separate_k_proj:
             self.attn_res_k_proj = nn.Linear(config.model.hidden_size, config.model.hidden_size, bias=False)
@@ -1156,9 +1163,7 @@ class AttentionResidualBlock(nn.Module):
             and not list(self.attn_res_norm.parameters())
             and not list(self.mlp_res_norm.parameters())
         )
-        nn.init.zeros_(self.attn_res_proj.weight)
-        nn.init.zeros_(self.mlp_res_proj.weight)
-        sequence_parallel_params = [self.attn_res_proj.weight, self.mlp_res_proj.weight]
+        sequence_parallel_params = [*self.attn_qs, *self.mlp_qs]
         if self.use_separate_k_proj:
             sequence_parallel_params.extend(
                 [
@@ -1284,7 +1289,7 @@ class AttentionResidualBlock(nn.Module):
         self,
         cache: dict,
         partial_block: torch.Tensor,
-        proj: nn.Linear,
+        query: torch.Tensor,
         *,
         key_name: str,
         norm: nn.Module,
@@ -1298,7 +1303,7 @@ class AttentionResidualBlock(nn.Module):
         if values is None or keys is None:
             raise ValueError("attention residual block requires at least one cached history block")
         values = values.to(dtype=keys.dtype)
-        query = proj.weight.squeeze(0).to(dtype=keys.dtype)
+        query = query.to(dtype=keys.dtype)
         if keys.ndim == 4:
             if history_prefix is not None:
                 history_logit, history_attended = history_prefix
@@ -1371,13 +1376,19 @@ class AttentionResidualBlock(nn.Module):
         aux_loss = None
         block_started = False
         history_includes_current_input = bool(state.pop(self._history_includes_input_key, False))
-        history_logits_pair: Optional[torch.Tensor] = None
-        history_prefix_pair: Optional[
-            tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
-        ] = None
+        history_logits_pairs: dict[int, torch.Tensor] = {}
+        history_prefix_pairs: dict[
+            int,
+            tuple[
+                Optional[tuple[torch.Tensor, torch.Tensor]],
+                Optional[tuple[torch.Tensor, torch.Tensor]],
+            ],
+        ] = {}
 
-        def get_history_prefix(name: str) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-            nonlocal history_prefix_pair
+        def get_history_prefix(
+            layer_index: int,
+            name: str,
+        ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
             if not _ATTRES_CACHE_HISTORY_PREFIX_PAIR:
                 return None
             if not self.share_attn_mlp_history_keys:
@@ -1388,13 +1399,13 @@ class AttentionResidualBlock(nn.Module):
             values = cache["values"]
             if keys is None or values is None:
                 return None
-            if history_prefix_pair is None:
+            if layer_index not in history_prefix_pairs:
                 t0 = _attres_profile_now()
-                history_prefix_pair = _attres_history_prefix_pair(
+                history_prefix_pairs[layer_index] = _attres_history_prefix_pair(
                     keys,
                     values.to(dtype=keys.dtype),
-                    self.attn_res_proj.weight.squeeze(0),
-                    self.mlp_res_proj.weight.squeeze(0),
+                    self.attn_qs[layer_index],
+                    self.mlp_qs[layer_index],
                     history_blocks=(
                         cache["blocks"]
                         if _ATTRES_RECOMPUTE_HISTORY_VALUES or _ATTRES_RECOMPUTE_HISTORY_KEYS
@@ -1404,10 +1415,9 @@ class AttentionResidualBlock(nn.Module):
                     history_norm_fp32=self.attn_res_norm.force_fp32,
                 )
                 _attres_profile_record("history_prefix_pair_precompute", t0)
-            return history_prefix_pair[0 if name == "attn" else 1]
+            return history_prefix_pairs[layer_index][0 if name == "attn" else 1]
 
-        def get_cached_history_logits(name: str) -> Optional[torch.Tensor]:
-            nonlocal history_logits_pair
+        def get_cached_history_logits(layer_index: int, name: str) -> Optional[torch.Tensor]:
             if (
                 _ATTRES_CACHE_HISTORY_PREFIX_PAIR
                 or not _ATTRES_CACHE_HISTORY_LOGITS_PAIR
@@ -1419,24 +1429,26 @@ class AttentionResidualBlock(nn.Module):
                 return None
             if paired_attres_history_logits is None:
                 raise RuntimeError("MEGATRON_ATTRES_CACHE_HISTORY_LOGITS_PAIR=1 requires paired-logit support")
+            history_logits_pair = history_logits_pairs.get(layer_index)
             if history_logits_pair is None or int(history_logits_pair.shape[1]) != int(keys.shape[0]):
                 queries = torch.stack(
                     (
-                        self.attn_res_proj.weight.squeeze(0).to(dtype=keys.dtype),
-                        self.mlp_res_proj.weight.squeeze(0).to(dtype=keys.dtype),
+                        self.attn_qs[layer_index].to(dtype=keys.dtype),
+                        self.mlp_qs[layer_index].to(dtype=keys.dtype),
                     ),
                     dim=0,
                 )
                 history_logits_pair = paired_attres_history_logits(keys, queries)
+                history_logits_pairs[layer_index] = history_logits_pair
             return history_logits_pair[0 if name == "attn" else 1]
 
-        for layer in self.layers:
+        for layer_index, layer in enumerate(self.layers):
             current_is_already_in_history = (cache["blocks"][-1] is partial_block) or (not block_started and history_includes_current_input)
             if _ATTRES_CACHE_HISTORY_PREFIX_PAIR and not block_started and not current_is_already_in_history:
                 t0 = _attres_profile_now()
                 self._append_cache_block(cache, partial_block)
-                history_logits_pair = None
-                history_prefix_pair = None
+                history_logits_pairs.clear()
+                history_prefix_pairs.clear()
                 current_is_already_in_history = True
                 _attres_profile_record("append_history", t0)
             include_current_partial = not (not block_started and current_is_already_in_history)
@@ -1444,21 +1456,21 @@ class AttentionResidualBlock(nn.Module):
             attn_hidden = self._block_attn_res(
                 cache,
                 partial_block,
-                self.attn_res_proj,
+                self.attn_qs[layer_index],
                 key_name="attn_keys",
                 norm=self.attn_res_norm,
                 k_proj=self.attn_res_k_proj if self.use_separate_k_proj else None,
                 include_partial=include_current_partial,
-                cached_history_logits=get_cached_history_logits("attn"),
-                history_prefix=get_history_prefix("attn"),
+                cached_history_logits=get_cached_history_logits(layer_index, "attn"),
+                history_prefix=get_history_prefix(layer_index, "attn"),
             )
             _attres_profile_record("attn_residual_read", t0)
             if not block_started:
                 if not current_is_already_in_history:
                     t0 = _attres_profile_now()
                     self._append_cache_block(cache, partial_block)
-                    history_logits_pair = None
-                    history_prefix_pair = None
+                    history_logits_pairs.clear()
+                    history_prefix_pairs.clear()
                     _attres_profile_record("append_history", t0)
                 block_started = True
                 history_includes_current_input = False
@@ -1484,21 +1496,25 @@ class AttentionResidualBlock(nn.Module):
             mlp_hidden = self._block_attn_res(
                 cache,
                 partial_block,
-                self.mlp_res_proj,
+                self.mlp_qs[layer_index],
                 key_name="mlp_keys",
                 norm=self.mlp_res_norm,
                 k_proj=self.mlp_res_k_proj if self.use_separate_k_proj else None,
-                cached_history_logits=get_cached_history_logits("mlp"),
-                history_prefix=get_history_prefix("mlp"),
+                cached_history_logits=get_cached_history_logits(layer_index, "mlp"),
+                history_prefix=get_history_prefix(layer_index, "mlp"),
             )
             _attres_profile_record("mlp_residual_read", t0)
             if self.full_history:
                 self._append_cache_block(cache, partial_block)
+                history_logits_pairs.clear()
+                history_prefix_pairs.clear()
             t0 = _attres_profile_now()
             partial_block = partial_block + layer.mlp_delta(mlp_hidden)
             _attres_profile_record("mlp_delta", t0)
             if self.full_history:
                 self._append_cache_block(cache, partial_block)
+                history_logits_pairs.clear()
+                history_prefix_pairs.clear()
             if layer.last_aux_loss is not None:
                 aux_loss = layer.last_aux_loss if aux_loss is None else aux_loss + layer.last_aux_loss
         state[self._history_key] = cache["blocks"]
@@ -1620,10 +1636,28 @@ class DualAttentionResidualBlock(nn.Module):
         self.mlp_dynamic_residual_mix_fn = nn.Parameter(
             torch.zeros(config.model.hidden_size * self.num_streams, 1, dtype=param_dtype)
         )
-        self.attn_q = nn.Parameter(torch.empty(self.num_streams, config.model.hidden_size, dtype=param_dtype))
-        self.mlp_q = nn.Parameter(torch.empty(self.num_streams, config.model.hidden_size, dtype=param_dtype))
-        init_dual_stream_query_(self.attn_q, preferred_stream=init_stream, balanced=_DUAL_Q_BALANCED)
-        init_dual_stream_query_(self.mlp_q, preferred_stream=init_stream, balanced=_DUAL_Q_BALANCED)
+        self.attn_qs = nn.ParameterList()
+        self.mlp_qs = nn.ParameterList()
+        for local_layer_index in range(len(self.layers)):
+            preferred_stream = (layer_index + local_layer_index) % self.num_streams
+            attn_q = nn.Parameter(
+                torch.empty(self.num_streams, config.model.hidden_size, dtype=param_dtype)
+            )
+            mlp_q = nn.Parameter(
+                torch.empty(self.num_streams, config.model.hidden_size, dtype=param_dtype)
+            )
+            init_dual_stream_query_(
+                attn_q,
+                preferred_stream=preferred_stream,
+                balanced=_DUAL_Q_BALANCED,
+            )
+            init_dual_stream_query_(
+                mlp_q,
+                preferred_stream=preferred_stream,
+                balanced=_DUAL_Q_BALANCED,
+            )
+            self.attn_qs.append(attn_q)
+            self.mlp_qs.append(mlp_q)
         _mark_sequence_parallel_parameters(
             self.pre_branch_scale,
             self.h_post_scale,
@@ -1638,8 +1672,8 @@ class DualAttentionResidualBlock(nn.Module):
             self.mlp_static_residual_logit,
             self.attn_dynamic_residual_mix_fn,
             self.mlp_dynamic_residual_mix_fn,
-            self.attn_q,
-            self.mlp_q,
+            *self.attn_qs,
+            *self.mlp_qs,
         )
         block_layers = max(1, int(config.model.hyper_conn_block_layers))
         self.max_history_len = (2 * config.model.num_layers) + 1 if self.full_history else (config.model.num_layers // block_layers) + 1
@@ -2245,10 +2279,13 @@ class DualAttentionResidualBlock(nn.Module):
         )
         attn_fused_weight = torch.cat((self.attn_dynamic_ab_fn, self.attn_dynamic_residual_mix_fn), dim=-1)
         mlp_fused_weight = torch.cat((self.mlp_dynamic_ab_fn, self.mlp_dynamic_residual_mix_fn), dim=-1)
-        history_logits_cache: dict[str, torch.Tensor] = {}
-        history_prefix_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        history_logits_cache: dict[tuple[int, str], torch.Tensor] = {}
+        history_prefix_cache: dict[
+            tuple[int, str], Optional[tuple[torch.Tensor, torch.Tensor]]
+        ] = {}
 
         def get_history_prefix(
+            layer_index: int,
             name: str,
             query: torch.Tensor,
             include_current: bool,
@@ -2259,16 +2296,16 @@ class DualAttentionResidualBlock(nn.Module):
                 return None
             if not include_current and int(keys.shape[1]) == 1:
                 return None
-            cached = history_prefix_cache.get(name)
-            if cached is not None:
-                return cached
+            cache_key = (layer_index, name)
+            if cache_key in history_prefix_cache:
+                return history_prefix_cache[cache_key]
             if _DUAL_CACHE_HISTORY_PREFIX_PAIR:
                 t0 = _dual_profile_now()
                 attn_prefix, mlp_prefix = _dual_history_prefix_pair(
                     keys,
                     values.to(dtype=keys.dtype),
-                    self.attn_q,
-                    self.mlp_q,
+                    self.attn_qs[layer_index],
+                    self.mlp_qs[layer_index],
                     history_blocks=(
                         cache["blocks"]
                         if _DUAL_RECOMPUTE_HISTORY_VALUES or _DUAL_RECOMPUTE_HISTORY_KEYS
@@ -2278,31 +2315,39 @@ class DualAttentionResidualBlock(nn.Module):
                     history_norm_fp32=self.history_key_norm.force_fp32,
                 )
                 _dual_profile_record("history_prefix_pair_precompute", t0)
-                history_prefix_cache["attn"] = attn_prefix
-                history_prefix_cache["mlp"] = mlp_prefix
-                return history_prefix_cache.get(name)
+                history_prefix_cache[(layer_index, "attn")] = attn_prefix
+                history_prefix_cache[(layer_index, "mlp")] = mlp_prefix
+                return history_prefix_cache[cache_key]
             t0 = _dual_profile_now()
             prefix = _dual_history_prefix(keys, values.to(dtype=keys.dtype), query)
             _dual_profile_record("history_prefix_precompute", t0)
-            history_prefix_cache[name] = prefix
+            history_prefix_cache[cache_key] = prefix
             return prefix
 
-        def get_history_logits(name: str, query: torch.Tensor, include_current: bool) -> Optional[torch.Tensor]:
+        def get_history_logits(
+            layer_index: int,
+            name: str,
+            query: torch.Tensor,
+            include_current: bool,
+        ) -> Optional[torch.Tensor]:
             keys = cache["keys"]
             if _DUAL_CACHE_HISTORY_PREFIX or not _DUAL_CACHE_HISTORY_LOGITS or keys is None:
                 return None
             if not include_current and int(keys.shape[1]) == 1:
                 return None
-            cached = history_logits_cache.get(name)
+            cache_key = (layer_index, name)
+            cached = history_logits_cache.get(cache_key)
             if cached is not None and int(cached.shape[1]) == int(keys.shape[1]):
                 return cached
             t0 = _dual_profile_now()
             logits = _dual_history_logits(keys, query.to(dtype=keys.dtype))
             _dual_profile_record("history_logits_precompute", t0)
-            history_logits_cache[name] = logits
+            history_logits_cache[cache_key] = logits
             return logits
 
-        for layer in self.layers:
+        for layer_index, layer in enumerate(self.layers):
+            attn_q = self.attn_qs[layer_index]
+            mlp_q = self.mlp_qs[layer_index]
             current_is_already_in_history = history_includes_current_input or (
                 bool(cache["blocks"]) and cache["blocks"][-1] is partial_block
             )
@@ -2315,19 +2360,29 @@ class DualAttentionResidualBlock(nn.Module):
                     history_prefix_cache.clear()
                     current_is_already_in_history = True
             include_current = not (not block_started and current_is_already_in_history)
-            attn_history_prefix = get_history_prefix("attn", self.attn_q, include_current)
+            attn_history_prefix = get_history_prefix(
+                layer_index,
+                "attn",
+                attn_q,
+                include_current,
+            )
             first_attn_in_block = not block_started
             t0 = _dual_profile_now()
             attn_mix = self._dual_block_attn_res(
                 cache,
                 partial_block,
-                self.attn_q,
+                attn_q,
                 attn_fused_weight,
                 self.attn_static_alpha,
                 self.attn_static_beta,
                 self.attn_static_residual_logit,
                 include_current=include_current,
-                history_logits=get_history_logits("attn", self.attn_q, include_current),
+                history_logits=get_history_logits(
+                    layer_index,
+                    "attn",
+                    attn_q,
+                    include_current,
+                ),
                 history_prefix=attn_history_prefix,
                 defer_partial_keep=_DUAL_DEFER_PARTIAL_KEEP_MIX,
             )
@@ -2465,16 +2520,16 @@ class DualAttentionResidualBlock(nn.Module):
             _dual_profile_record("attn_merge", t0)
 
             t0 = _dual_profile_now()
-            mlp_history_prefix = get_history_prefix("mlp", self.mlp_q, True)
+            mlp_history_prefix = get_history_prefix(layer_index, "mlp", mlp_q, True)
             mlp_mix = self._dual_block_attn_res(
                 cache,
                 partial_block,
-                self.mlp_q,
+                mlp_q,
                 mlp_fused_weight,
                 self.mlp_static_alpha,
                 self.mlp_static_beta,
                 self.mlp_static_residual_logit,
-                history_logits=get_history_logits("mlp", self.mlp_q, True),
+                history_logits=get_history_logits(layer_index, "mlp", mlp_q, True),
                 history_prefix=mlp_history_prefix,
                 defer_partial_keep=_DUAL_DEFER_PARTIAL_KEEP_MIX,
             )
@@ -2491,6 +2546,8 @@ class DualAttentionResidualBlock(nn.Module):
             _dual_profile_record("mlp_residual_read", t0)
             if self.full_history:
                 self._append_block(cache, partial_block)
+                history_logits_cache.clear()
+                history_prefix_cache.clear()
             t0 = _dual_profile_now()
             mlp_delta = layer.mlp_delta(mlp_hidden)
             _dual_profile_record("mlp_delta", t0)
@@ -2552,6 +2609,8 @@ class DualAttentionResidualBlock(nn.Module):
             _dual_profile_record("mlp_merge", t0)
             if self.full_history:
                 self._append_block(cache, partial_block)
+                history_logits_cache.clear()
+                history_prefix_cache.clear()
             if layer.last_aux_loss is not None:
                 aux_loss = layer.last_aux_loss if aux_loss is None else aux_loss + layer.last_aux_loss
         state[self._history_key] = cache["blocks"]
