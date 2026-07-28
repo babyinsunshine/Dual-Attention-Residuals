@@ -92,11 +92,8 @@ if _TRITON_AVAILABLE:
     ):
         offsets = tl.program_id(0) * block + tl.arange(0, block)
         mask = offsets < elements
-        hidden = tl.load(attention_input + offsets, mask=mask, other=0.0).to(tl.float32)
         raw = tl.load(raw_attention + offsets, mask=mask, other=0.0).to(tl.float32)
-        with_residual = _round_bf16_fp32(hidden + raw)
-        delta = _round_bf16_fp32(with_residual - hidden)
-        tl.store(delta_out + offsets, delta, mask=mask)
+        tl.store(delta_out + offsets, raw, mask=mask)
 
 
     @triton.jit
@@ -117,10 +114,8 @@ if _TRITON_AVAILABLE:
         h = tl.program_id(1) * block_h + tl.arange(0, block_h)
         mask = (row < rows) & (h < hidden_size)
         offset = row * hidden_size + h
-        hidden = tl.load(attention_input + offset, mask=mask, other=0.0).to(tl.float32)
         raw = tl.load(raw_attention + offset, mask=mask, other=0.0).to(tl.float32)
-        with_residual = _round_bf16_fp32(hidden + raw)
-        delta = _round_bf16_fp32(with_residual - hidden)
+        delta = raw
         beta0 = tl.load(beta + row * 2 + 0).to(tl.float32)
         beta1 = tl.load(beta + row * 2 + 1).to(tl.float32)
         if has_residual:
