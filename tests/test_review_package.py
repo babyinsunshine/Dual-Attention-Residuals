@@ -111,7 +111,12 @@ def test_dependency_metadata_matches_documented_runtime() -> None:
         for line in (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     }
-    for dependency in ("megatron-core==0.16.1", "huggingface-hub==0.36.2"):
+    for dependency in (
+        "torch==2.10.0",
+        "megatron-core==0.16.1",
+        "transformer-engine[pytorch]==2.10.0",
+        "huggingface-hub==0.36.2",
+    ):
         assert dependency in project_dependencies
         assert dependency in requirements
     assert not any(item.lower().startswith("datasets") for item in project_dependencies)
