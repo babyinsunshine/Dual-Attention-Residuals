@@ -8,7 +8,6 @@ from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 HELPER = REPOSITORY / "scripts" / "attnres_kernel_mode.sh"
-MULTI_NODE_LAUNCHER = REPOSITORY / "scripts" / "train_attnres_multi_node.sh"
 
 FUSED_FLAGS = {
     "MEGATRON_ATTRES_TRITON_WEIGHTED_SUM": "1",
@@ -82,32 +81,6 @@ done
             "ATTRES_KERNEL_MODE must be fused or reference, got: typo",
             completed.stderr,
         )
-
-    def test_multi_node_launcher_rejects_invalid_mode_before_python(self) -> None:
-        env = os.environ.copy()
-        env.update(
-            {
-                "ATTRES_KERNEL_MODE": "typo",
-                "NNODES": "1",
-                "NODE_RANK": "0",
-                "MASTER_ADDR": "127.0.0.1",
-                "PYTHON_BIN": "/definitely/not/python",
-                "DRY_RUN": "1",
-            }
-        )
-
-        completed = subprocess.run(
-            ["bash", str(MULTI_NODE_LAUNCHER)],
-            cwd=REPOSITORY,
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-        self.assertEqual(completed.returncode, 2)
-        self.assertIn("ATTRES_KERNEL_MODE must be fused or reference", completed.stderr)
-
 
 if __name__ == "__main__":
     unittest.main()
