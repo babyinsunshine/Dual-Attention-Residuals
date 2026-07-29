@@ -19,11 +19,6 @@ paths so that only the residual mechanism changes across comparisons.
 - Optimized Triton operators with reference PyTorch paths for verification.
 - Ready-to-use single-node and multi-node launchers built on Megatron-Core.
 
-## Checkpoint
-
-DAR weights are available on Hugging Face Hub as
-[`moddells/dual-attentions-residuals-60k`](https://huggingface.co/moddells/dual-attentions-residuals-60k).
-
 ## Quick start
 
 ### Install
