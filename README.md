@@ -12,7 +12,7 @@ with torch 2.10.0, megatron-core 0.18.2, and transformer-engine 2.10.0.
 
 ```bash
 python -m pip install torch==2.10.0 megatron-core==0.18.2 transformer-engine[pytorch]==2.10.0
-python -m pip install triton numpy pyarrow pyyaml sentencepiece datasets pytest
+python -m pip install triton numpy pyarrow pyyaml sentencepiece huggingface-hub pytest
 ```
 
 ## Data
@@ -32,7 +32,10 @@ download concurrency.
 The preprocessor reads the default raw directory and writes `train.bin`,
 `val.bin`, and `metadata.json` to `data/fineweb_edu_100BT_pretok`. Use
 `--num-workers` to set preprocessing workers and `--resume` to continue a
-previous run. For a bounded smoke run, limit the input with `--max-files`:
+previous run. It appends an EOS token by default so adjacent documents remain
+separated; use `--no-add-eos` only for controlled experiments. The EOS setting
+is part of the resume identity, so a run cannot resume with a different setting.
+For a bounded smoke run, limit the input with `--max-files`:
 
 ```bash
 python data/preprocess.py --max-files 2 --num-workers 2

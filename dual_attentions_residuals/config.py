@@ -66,8 +66,8 @@ class ParallelConfig:
 @dataclass
 class TrainConfig:
     output_dir: str = "outputs/megatron_7b_moe"
-    train_tokens_file: str = "data/fineweb_edu_pretok/train.bin"
-    val_tokens_file: str = "data/fineweb_edu_pretok/val.bin"
+    train_tokens_file: str = "data/fineweb_edu_100BT_pretok/train.bin"
+    val_tokens_file: str = "data/fineweb_edu_100BT_pretok/val.bin"
     seed: int = 42
     micro_batch_size: int = 4
     global_batch_size: int = 128

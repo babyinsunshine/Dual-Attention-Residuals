@@ -11,15 +11,22 @@ requires-python = ">=3.10,<3.11"
 license = { text = "MIT" }
 dependencies = [
   "torch==2.10.0",
-  "megatron-core==0.16.1",
+  "megatron-core==0.18.2",
   "transformer-engine[pytorch]==2.10.0",
   "triton==3.6.0",
   "numpy==1.26.4",
   "pyarrow==21.0.0",
   "PyYAML==6.0.3",
   "sentencepiece==0.2.1",
-  "datasets==5.0.0",
+  "huggingface-hub==0.36.2",
 ]
 
 [tool.setuptools.packages.find]
 include = ["dual_attentions_residuals*", "data*"]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+  "ignore:^builtin type SwigPyPacked has no __module__ attribute$:DeprecationWarning",
+  "ignore:^builtin type SwigPyObject has no __module__ attribute$:DeprecationWarning",
+  "ignore:^builtin type swigvarlink has no __module__ attribute$:DeprecationWarning",
+]

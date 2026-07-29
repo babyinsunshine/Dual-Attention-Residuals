@@ -73,7 +73,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--validation-tokens", type=positive_int, default=10_000_000)
     parser.add_argument("--max-files", type=positive_int)
     parser.add_argument("--add-bos", action="store_true")
-    parser.add_argument("--add-eos", action="store_true")
+    eos = parser.add_mutually_exclusive_group()
+    eos.add_argument("--add-eos", dest="add_eos", action="store_true")
+    eos.add_argument(
+        "--no-add-eos",
+        dest="add_eos",
+        action="store_false",
+        help="Do not append an EOS token to each document.",
+    )
+    parser.set_defaults(add_eos=True)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--resume", action="store_true")
     mode.add_argument("--overwrite", action="store_true")

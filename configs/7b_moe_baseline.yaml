@@ -27,8 +27,8 @@ parallel:
 
 train:
   output_dir: outputs/7b_moe_baseline
-  train_tokens_file: data/processed/train.bin
-  val_tokens_file: data/processed/val.bin
+  train_tokens_file: data/fineweb_edu_100BT_pretok/train.bin
+  val_tokens_file: data/fineweb_edu_100BT_pretok/val.bin
   micro_batch_size: 4
   global_batch_size: 128
   train_iters: 100000

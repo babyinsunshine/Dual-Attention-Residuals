@@ -27,6 +27,7 @@ class DiscoveryTests(unittest.TestCase):
             "data/fineweb_edu_100BT/sample/100BT/*.parquet",
         )
         self.assertEqual(args.output_dir, "data/fineweb_edu_100BT_pretok")
+        self.assertTrue(args.add_eos)
 
     def test_direct_script_help_runs_from_repository_root(self) -> None:
         repository = Path(__file__).resolve().parents[1]
@@ -41,6 +42,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn("--input-glob", completed.stdout)
         self.assertIn("--num-workers", completed.stdout)
         self.assertIn("--validation-tokens", completed.stdout)
+        self.assertIn("--no-add-eos", completed.stdout)
         self.assertIn("data/fineweb_edu_100BT/sample/100BT/*.parquet", completed.stdout)
         self.assertIn("data/fineweb_edu_100BT_pretok", completed.stdout)
 
@@ -72,6 +74,12 @@ class DiscoveryTests(unittest.TestCase):
     def test_parse_args_rejects_resume_and_overwrite_together(self) -> None:
         with self.assertRaises(SystemExit):
             pp.parse_args(["--input-glob", "x", "--resume", "--overwrite"])
+
+    def test_parse_args_allows_explicit_eos_opt_out(self) -> None:
+        self.assertTrue(pp.parse_args(["--input-glob", "x", "--add-eos"]).add_eos)
+        self.assertFalse(pp.parse_args(["--input-glob", "x", "--no-add-eos"]).add_eos)
+        with self.assertRaises(SystemExit):
+            pp.parse_args(["--input-glob", "x", "--add-eos", "--no-add-eos"])
 
     def test_atomic_write_json_replaces_complete_document(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -131,6 +139,21 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(first.digest(), second.digest())
             self.assertEqual(first.tokenizer_path, str(tokenizer_path.resolve()))
             self.assertEqual(first.tokenizer_sha256, pp.sha256(tokenizer_path))
+
+    def test_run_identity_distinguishes_default_eos_from_explicit_opt_out(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_path = root / "input.parquet"
+            tokenizer_path = root / "tokenizer.model"
+            input_path.write_bytes(b"input")
+            tokenizer_path.write_bytes(b"tokenizer")
+            with_eos = pp.build_run_identity(
+                [input_path], tokenizer_path, pp.EXPECTED_VOCAB_SIZE, "text", False, True
+            )
+            without_eos = pp.build_run_identity(
+                [input_path], tokenizer_path, pp.EXPECTED_VOCAB_SIZE, "text", False, False
+            )
+            self.assertNotEqual(with_eos.digest(), without_eos.digest())
 
 
 class FakeTokenizer:

@@ -8,6 +8,8 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 data/processed/
+data/fineweb_edu_100BT/
+data/fineweb_edu_100BT_pretok/
 outputs/
 checkpoints/
 logs/
