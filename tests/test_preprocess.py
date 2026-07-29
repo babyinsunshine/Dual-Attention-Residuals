@@ -16,14 +16,22 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from data import preprocess_parallel as pp
+from data import preprocess as pp
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_review_package_defaults(self) -> None:
+        args = pp.parse_args([])
+        self.assertEqual(
+            args.input_glob,
+            "data/fineweb_edu_100BT/sample/100BT/*.parquet",
+        )
+        self.assertEqual(args.output_dir, "data/fineweb_edu_100BT_pretok")
+
     def test_direct_script_help_runs_from_repository_root(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         completed = subprocess.run(
-            [sys.executable, "data/preprocess_parallel.py", "--help"],
+            [sys.executable, "data/preprocess.py", "--help"],
             cwd=repository,
             capture_output=True,
             text=True,
@@ -33,6 +41,8 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn("--input-glob", completed.stdout)
         self.assertIn("--num-workers", completed.stdout)
         self.assertIn("--validation-tokens", completed.stdout)
+        self.assertIn("data/fineweb_edu_100BT/sample/100BT/*.parquet", completed.stdout)
+        self.assertIn("data/fineweb_edu_100BT_pretok", completed.stdout)
 
     def test_discover_inputs_sorts_resolved_paths_and_limits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1460,7 +1470,7 @@ class EndToEndTests(unittest.TestCase):
             completed = subprocess.run(
                 [
                     sys.executable,
-                    "data/preprocess_parallel.py",
+                    "data/preprocess.py",
                     "--input-glob", str(source),
                     "--tokenizer", str(repository / "tokenizer" / "tokenizer.model"),
                     "--output-dir", str(output),
@@ -1530,7 +1540,7 @@ class EndToEndTests(unittest.TestCase):
             completed = subprocess.run(
                 [
                     sys.executable,
-                    "data/preprocess_parallel.py",
+                    "data/preprocess.py",
                     "--input-glob", str(inputs / "*.parquet"),
                     "--tokenizer", str(repository / "tokenizer" / "tokenizer.model"),
                     "--output-dir", str(output),
