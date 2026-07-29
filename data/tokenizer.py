@@ -1,8 +1,29 @@
 from __future__ import annotations
 
+import atexit
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Protocol
+
+
+_SENTENCEPIECE_SWIG_DEPRECATIONS = (
+    "builtin type SwigPyPacked has no __module__ attribute",
+    "builtin type SwigPyObject has no __module__ attribute",
+    "builtin type swigvarlink has no __module__ attribute",
+)
+
+
+def _filter_sentencepiece_swig_deprecations() -> None:
+    """Ignore the exact legacy-SWIG import warnings emitted by SentencePiece."""
+    for message in _SENTENCEPIECE_SWIG_DEPRECATIONS:
+        warnings.filterwarnings("ignore", message=f"^{message}$", category=DeprecationWarning)
+
+
+_filter_sentencepiece_swig_deprecations()
+# The final warning is emitted as the extension tears down after pytest restores
+# its warning state, so install the same exact filters immediately before exit.
+atexit.register(_filter_sentencepiece_swig_deprecations)
 
 import sentencepiece as spm
 
