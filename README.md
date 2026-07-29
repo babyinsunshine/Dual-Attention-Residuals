@@ -8,10 +8,10 @@ mechanisms can be evaluated consistently.
 ## Environment
 
 Use Python 3.10 with CUDA-capable PyTorch. The reviewer workflow was tested
-with torch 2.10.0, megatron-core 0.18.2, and transformer-engine 2.10.0.
+with torch 2.10.0, megatron-core 0.16.1, and transformer-engine 2.10.0.
 
 ```bash
-python -m pip install torch==2.10.0 megatron-core==0.18.2 transformer-engine[pytorch]==2.10.0
+python -m pip install torch==2.10.0 megatron-core==0.16.1 transformer-engine[pytorch]==2.10.0
 python -m pip install triton numpy pyarrow pyyaml sentencepiece huggingface-hub pytest
 ```
 

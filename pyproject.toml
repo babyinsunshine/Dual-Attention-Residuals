@@ -11,7 +11,7 @@ requires-python = ">=3.10,<3.11"
 license = { text = "MIT" }
 dependencies = [
   "torch==2.10.0",
-  "megatron-core==0.18.2",
+  "megatron-core==0.16.1",
   "transformer-engine[pytorch]==2.10.0",
   "triton==3.6.0",
   "numpy==1.26.4",
