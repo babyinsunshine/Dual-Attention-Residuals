@@ -14,7 +14,7 @@ def require_megatron_core() -> None:
     except Exception as exc:  # pragma: no cover - depends on target cluster
         raise MegatronCoreImportError(
             "Megatron-Core is required for this copied project. Install NVIDIA Megatron-LM/"
-            "Megatron-Core on the H100 training image before launching train.py."
+            "Megatron-Core on the H800 training image before launching train.py."
         ) from exc
 
 
