@@ -69,9 +69,9 @@ class TrainConfig:
     train_tokens_file: str = "data/fineweb_edu_100BT_pretok/train.bin"
     val_tokens_file: str = "data/fineweb_edu_100BT_pretok/val.bin"
     seed: int = 42
-    micro_batch_size: int = 4
+    micro_batch_size: int = 2
     global_batch_size: int = 128
-    train_iters: int = 100000
+    train_iters: int = 60000
     eval_interval: int = 1000
     eval_iters: int = 20
     save_interval: int = 1000
@@ -80,6 +80,11 @@ class TrainConfig:
     start_token: int = 0
     lr: float = 3.0e-4
     min_lr: float = 3.0e-5
+    enable_lr_scheduler: bool = True
+    lr_warmup_iters: int = 2000
+    lr_decay_iters: Optional[int] = None
+    lr_decay_style: str = "cosine"
+    lr_warmup_init_lr: float = 0.0
     weight_decay: float = 0.1
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95

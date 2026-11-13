@@ -2,6 +2,9 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
+source "$ROOT/scripts/dual_kernel_mode.sh"
+configure_dual_kernel_mode
+echo "DUAL_KERNEL_MODE=$DUAL_KERNEL_MODE" >&2
 PYTHON_BIN="${PYTHON_BIN:-python}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"

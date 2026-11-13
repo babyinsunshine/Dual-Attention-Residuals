@@ -700,17 +700,20 @@ def wandb_finish() -> None:
     _WANDB_RUN = None
 
 
-def lr_scheduler_enabled() -> bool:
-    return env_bool("MEGATRON_ENABLE_LR_SCHEDULER", False)
+def lr_scheduler_enabled(cfg) -> bool:
+    return env_bool("MEGATRON_ENABLE_LR_SCHEDULER", cfg.train.enable_lr_scheduler)
 
 
 def lr_scheduler_settings(cfg) -> tuple[bool, int, int, str, float]:
-    enabled = lr_scheduler_enabled()
-    warmup_iters = max(0, env_int("MEGATRON_LR_WARMUP_ITERS", 0))
-    decay_iters = env_int("MEGATRON_LR_DECAY_ITERS", int(cfg.train.train_iters))
+    enabled = lr_scheduler_enabled(cfg)
+    warmup_iters = max(0, env_int("MEGATRON_LR_WARMUP_ITERS", cfg.train.lr_warmup_iters))
+    configured_decay_iters = cfg.train.lr_decay_iters
+    if configured_decay_iters is None:
+        configured_decay_iters = cfg.train.train_iters
+    decay_iters = env_int("MEGATRON_LR_DECAY_ITERS", int(configured_decay_iters))
     decay_iters = max(warmup_iters + 1, decay_iters)
-    style = os.environ.get("MEGATRON_LR_DECAY_STYLE", "cosine").strip().lower()
-    warmup_init_lr = env_float("MEGATRON_LR_WARMUP_INIT_LR", 0.0)
+    style = os.environ.get("MEGATRON_LR_DECAY_STYLE", cfg.train.lr_decay_style).strip().lower()
+    warmup_init_lr = env_float("MEGATRON_LR_WARMUP_INIT_LR", cfg.train.lr_warmup_init_lr)
     return enabled, warmup_iters, decay_iters, style, warmup_init_lr
 
 
