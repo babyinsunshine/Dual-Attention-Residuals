@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -64,6 +65,7 @@ configure_dual_kernel_mode
 for name in ${!MEGATRON_DUAL_@}; do
   printf '%s=%s\\n' "$name" "${!name}"
 done
+printf 'MEGATRON_RESIDUAL_TE_ATTENTION_EPILOGUE=%s\\n' "$MEGATRON_RESIDUAL_TE_ATTENTION_EPILOGUE"
 '''
     result = subprocess.run(
         ["bash", "-euc", command, "bash", (ROOT / "scripts" / "dual_kernel_mode.sh").as_posix()],
@@ -71,6 +73,7 @@ done
     )
     assert result.returncode == 0, result.stderr
     values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    assert values["MEGATRON_RESIDUAL_TE_ATTENTION_EPILOGUE"] == optimized
     for suffix, value in {
         "KV_MODE": "cross", "AB_SOURCE": "attended", "KEEP_SOURCE": "partial",
         "CURRENT_PARTIAL_RESIDUAL": "1", "CURRENT_KEY_IMPL": "stream_norm",
@@ -84,6 +87,24 @@ done
         "TE_ATTENTION_EPILOGUE",
     ):
         assert values[f"MEGATRON_DUAL_{suffix}"] == optimized
+
+
+def test_dual_reference_runs_forward_and_backward_on_cpu():
+    program = """
+import torch
+from dual_attentions_residuals.residual_blocks import DualAttentionResidualBlock
+from tests.test_per_layer_residual_queries import make_config, make_layers
+block = DualAttentionResidualBlock(make_config("dual_attention_residual_block"), make_layers(3), 0)
+x = torch.randn(4, 2, 8, requires_grad=True)
+block(x, state={}).sum().backward()
+assert torch.isfinite(x.grad).all()
+"""
+    subprocess.run(
+        ["bash", "-euc", 'source scripts/dual_kernel_mode.sh; configure_dual_kernel_mode; exec "$1" -c "$2"',
+         "bash", Path(sys.executable).as_posix(), program],
+        cwd=ROOT, env={**os.environ, "DUAL_KERNEL_MODE": "reference", "CUDA_VISIBLE_DEVICES": ""},
+        check=True,
+    )
 
 
 def test_dual_mode_rejects_unknown_value():

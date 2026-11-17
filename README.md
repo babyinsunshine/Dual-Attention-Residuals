@@ -94,6 +94,11 @@ and `MEGATRON_LR_*` variables override the YAML schedule; the commands above set
 them explicitly. Each run prints its effective schedule at startup. Add
 `DRY_RUN=1` before a launcher to print its command without starting training.
 
+To resume training, set `MEGATRON_LOAD_CHECKPOINT` to the existing output
+directory and run the same launcher. New checkpoints record the next training
+sample position. For older checkpoints, use the original batch and worker
+settings so the position can be reconstructed from the saved step.
+
 Both residual launchers default to fused execution. The complete kernel
 switches are in `scripts/attnres_kernel_mode.sh` and
 `scripts/dual_kernel_mode.sh`. Set the corresponding mode to `reference` for

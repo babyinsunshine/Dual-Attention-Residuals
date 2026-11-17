@@ -36,4 +36,5 @@ configure_dual_kernel_mode() {
   export MEGATRON_DUAL_TRITON_HISTORY_APPEND_PACK="$optimized"
   export MEGATRON_DUAL_TRITON_HISTORY_APPEND_PACK_STRICT="$optimized"
   export MEGATRON_DUAL_TE_ATTENTION_EPILOGUE="$optimized"
+  export MEGATRON_RESIDUAL_TE_ATTENTION_EPILOGUE="$optimized"
 }

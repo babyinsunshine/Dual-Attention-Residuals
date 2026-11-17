@@ -116,13 +116,30 @@ def test_checkpoint_loads_distributed_optimizer_parameter_state(
     monkeypatch.setattr(torch, "load", lambda *args, **kwargs: payload)
     monkeypatch.setattr(train, "cleanup_after_checkpoint_load", lambda: None)
 
+    train_data = {}
     loaded_step = train.load_checkpoint(
         str(checkpoint_file),
         module,
         optimizer,
         None,
+        train_data_state=train_data,
     )
 
     expected = checkpoint_file.parent / "optimizer_parameter_state_rank_00000.pt"
     assert loaded_step == 10
+    assert train_data == {}  # Legacy checkpoint; the trainer derives the cursor from the step.
     assert f"load_optimizer_parameters:{expected}" in events
+
+
+def test_checkpoint_round_trips_training_data_progress(tmp_path):
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    progress = {
+        "consumed_samples": 640,
+        "start_token": 12,
+        "sample_order": {"micro_batch_size": 2, "num_workers": 3, "dp_size": 2},
+    }
+    train.maybe_save_checkpoint(tmp_path, model, optimizer, None, step=10, train_data_state=progress)
+    restored = {}
+    assert train.load_checkpoint(str(tmp_path), model, optimizer, None, train_data_state=restored) == 10
+    assert restored == progress

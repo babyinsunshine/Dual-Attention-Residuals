@@ -1,11 +1,27 @@
 from __future__ import annotations
 
-from pathlib import Path
 import math
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset
+
+
+@dataclass(frozen=True)
+class PackedSampleOrder:
+    micro_batch_size: int
+    num_workers: int
+    dp_size: int
+
+    def dataset_index(self, position: int) -> int:
+        """Map a global sample position to the original interleaved worker shards."""
+        batch, offset = divmod(position, self.dp_size * self.micro_batch_size)
+        rank, item = divmod(offset, self.micro_batch_size)
+        rounds, worker = divmod(batch, self.num_workers)
+        worker_item = rounds * self.micro_batch_size + item
+        return (worker_item * self.dp_size + rank) * self.num_workers + worker
 
 
 class PackedTokenDataset(IterableDataset):
@@ -16,6 +32,11 @@ class PackedTokenDataset(IterableDataset):
         seed: int = 42,
         start_token: int = 0,
         shuffle_buffer_size: int = 10000,
+        *,
+        micro_batch_size: int = 1,
+        consumed_samples: int = 0,
+        sample_order: PackedSampleOrder | None = None,
+        data_parallel: tuple[int, int] | None = None,
     ) -> None:
         super().__init__()
         self.path = str(path)
@@ -23,6 +44,10 @@ class PackedTokenDataset(IterableDataset):
         self.chunk_size = self.seq_length + 1
         self.seed = int(seed)
         self.start_sample = int(start_token) // self.seq_length
+        self.micro_batch_size = micro_batch_size
+        self.consumed_samples = consumed_samples
+        self.sample_order = sample_order
+        self.data_parallel = data_parallel
         self.shuffle_window = max(1, int(shuffle_buffer_size))
         self.tokens = np.memmap(self.path, dtype=np.int32, mode="r")
         if self.tokens.shape[0] <= self.chunk_size:
@@ -49,16 +74,16 @@ class PackedTokenDataset(IterableDataset):
         worker = torch.utils.data.get_worker_info()
         worker_id = 0 if worker is None else worker.id
         num_workers = 1 if worker is None else worker.num_workers
-        rank, world = _data_parallel_rank_and_world()
-        num_shards = world * num_workers
-        shard_id = rank * num_workers + worker_id
-        sample_index = self.start_sample + shard_id
+        rank, world = self.data_parallel or _data_parallel_rank_and_world()
+        order = self.sample_order or PackedSampleOrder(self.micro_batch_size, num_workers, world)
+        batch_size = self.micro_batch_size
+        samples_per_microbatch = world * batch_size
+        # DataLoader dispatches whole batches to workers in round-robin order.
+        position = self.consumed_samples + worker_id * samples_per_microbatch + rank * batch_size
         while True:
-            sequence_index = self._sequence_index(sample_index)
-            start = sequence_index * self.seq_length
-            sample = np.asarray(self.tokens[start : start + self.chunk_size], dtype=np.int64)
-            yield torch.from_numpy(sample)
-            sample_index += num_shards
+            for item in range(batch_size):
+                yield self[order.dataset_index(position + item)]
+            position += num_workers * samples_per_microbatch
 
     def _sequence_index(self, sample_index: int) -> int:
         if self.shuffle_window <= 1:

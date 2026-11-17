@@ -7,6 +7,7 @@ import math
 import os
 import time
 from contextlib import nullcontext
+from dataclasses import asdict
 from pathlib import Path
 
 
@@ -45,7 +46,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from dual_attentions_residuals import build_model, load_config
-from dual_attentions_residuals.data import PackedTokenDataset, batch_to_tokens_and_labels
+from dual_attentions_residuals.data import PackedSampleOrder, PackedTokenDataset, batch_to_tokens_and_labels
 from dual_attentions_residuals.mcore_compat import call_with_supported_kwargs, require_megatron_core
 
 
@@ -1370,6 +1371,8 @@ def maybe_save_checkpoint(
     optimizer: torch.optim.Optimizer,
     lr_scheduler,
     step: int,
+    *,
+    train_data_state: dict | None = None,
 ) -> None:
     if not checkpoint_saving_enabled():
         return
@@ -1398,6 +1401,8 @@ def maybe_save_checkpoint(
             "rng_state": torch.get_rng_state(),
             "cuda_rng_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
         }
+        if train_data_state is not None:
+            payload["train_data"] = train_data_state
         torch.save(payload, ckpt_dir / f"rank_{rank:05d}.pt")
         if hasattr(optimizer, "save_parameter_state"):
             optimizer.save_parameter_state(
@@ -1464,6 +1469,8 @@ def load_checkpoint(
     model: torch.nn.Module,
     optimizer,
     lr_scheduler,
+    *,
+    train_data_state: dict | None = None,
 ) -> int:
     ckpt_file = resolve_checkpoint_file(load_path)
     startup_log(f"checkpoint load begin file={ckpt_file} {cuda_memory_text()}", all_ranks=True)
@@ -1505,6 +1512,9 @@ def load_checkpoint(
     if torch.cuda.is_available() and checkpoint.get("cuda_rng_state") is not None:
         torch.cuda.set_rng_state(checkpoint["cuda_rng_state"])
     step = int(checkpoint.get("step", 0))
+    if train_data_state is not None:
+        train_data_state.clear()
+        train_data_state.update(checkpoint.get("train_data", {}))
     del checkpoint
     cleanup_after_checkpoint_load()
     startup_log(f"checkpoint loaded file={ckpt_file} step={step} {cuda_memory_text()}", all_ranks=True)
@@ -1864,7 +1874,7 @@ def main() -> None:
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
     pp_size = pipeline_world_size()
     dp_size = max(1, data_parallel_world_size())
-    pre_grad_accum_steps = max(
+    grad_accum_steps = max(
         1,
         math.ceil(cfg.train.global_batch_size / (cfg.train.micro_batch_size * dp_size)),
     )
@@ -1874,7 +1884,7 @@ def main() -> None:
         training_stack="post_distributed_pre_model",
         dp_size=dp_size,
         pp_size=pp_size,
-        grad_accum_steps=pre_grad_accum_steps,
+        grad_accum_steps=grad_accum_steps,
         lr_scheduler=None,
     )
     wandb_barrier_if_enabled()
@@ -1905,7 +1915,11 @@ def main() -> None:
         f"current_lr={_optimizer_lr_text(optimizer)}",
         all_ranks=True,
     )
-    loaded_step = load_checkpoint(load_path, model, optimizer, lr_scheduler) if load_path else 0
+    train_data_state = {}
+    loaded_step = (
+        load_checkpoint(load_path, model, optimizer, lr_scheduler, train_data_state=train_data_state)
+        if load_path else 0
+    )
     start_step = loaded_step + 1
     if start_step > cfg.train.train_iters:
         if torch.distributed.get_rank() == 0:
@@ -1915,15 +1929,35 @@ def main() -> None:
             )
         return
 
-    grad_accum_steps = max(1, math.ceil(cfg.train.global_batch_size / (cfg.train.micro_batch_size * dp_size)))
+    samples_per_step = grad_accum_steps * cfg.train.micro_batch_size * dp_size
+    # Old checkpoints contain only the step. Use the original batch settings when resuming one.
+    consumed_at_resume = train_data_state.get("consumed_samples", loaded_step * samples_per_step)
+    start_token = train_data_state.get("start_token", cfg.train.start_token)
+    if "sample_order" in train_data_state:
+        sample_order = PackedSampleOrder(**train_data_state["sample_order"])
+    else:
+        sample_order = PackedSampleOrder(cfg.train.micro_batch_size, max(1, cfg.train.dataloader_workers), dp_size)
+
+    def save_training_checkpoint(step: int) -> None:
+        # Count batches consumed by the training loop, excluding DataLoader prefetch.
+        progress = {
+            "consumed_samples": consumed_at_resume + (step - loaded_step) * samples_per_step,
+            "start_token": start_token,
+            "sample_order": asdict(sample_order),
+        }
+        maybe_save_checkpoint(cfg.train.output_dir, model, optimizer, lr_scheduler, step, train_data_state=progress)
 
     startup_log(f"dataset begin path={cfg.train.train_tokens_file}", all_ranks=True)
     dataset = PackedTokenDataset(
         cfg.train.train_tokens_file,
         cfg.model.seq_length,
         seed=cfg.train.seed,
-        start_token=cfg.train.start_token,
+        start_token=start_token,
         shuffle_buffer_size=cfg.train.shuffle_buffer_size,
+        micro_batch_size=cfg.train.micro_batch_size,
+        consumed_samples=consumed_at_resume,
+        sample_order=sample_order,
+        data_parallel=(data_parallel_rank(), dp_size),
     )
     startup_log(f"dataset done num_sequences={dataset.num_sequences}", all_ranks=True)
     startup_log("dataloader begin", all_ranks=True)
@@ -1979,7 +2013,8 @@ def main() -> None:
             f"recompute={cfg.train.recompute_granularity or 'none'} "
             f"moe_dispatcher={cfg.model.moe_token_dispatcher_type} "
             f"moe_permute_fusion={getattr(cfg.model, 'moe_permute_fusion', False)} "
-            f"start_token={cfg.train.start_token} shuffle_buffer={cfg.train.shuffle_buffer_size} "
+            f"start_token={start_token} consumed_train_samples={consumed_at_resume} "
+            f"shuffle_buffer={cfg.train.shuffle_buffer_size} "
             f"training_stack={training_stack}{overlap_text} pp_package={pp_package_text}"
         )
         print(
@@ -2140,7 +2175,7 @@ def main() -> None:
                 zero_training_gradients(model, optimizer, reset_grad_buffers=False)
 
             if cfg.train.save_interval > 0 and step % cfg.train.save_interval == 0:
-                maybe_save_checkpoint(cfg.train.output_dir, model, optimizer, lr_scheduler, step)
+                save_training_checkpoint(step)
 
         if val_iterator is not None and cfg.train.train_iters % cfg.train.eval_interval != 0:
             zero_training_gradients(model, optimizer, reset_grad_buffers=False)
@@ -2157,7 +2192,7 @@ def main() -> None:
             zero_training_gradients(model, optimizer, reset_grad_buffers=False)
 
         if cfg.train.save_interval <= 0 or cfg.train.train_iters % cfg.train.save_interval != 0:
-            maybe_save_checkpoint(cfg.train.output_dir, model, optimizer, lr_scheduler, cfg.train.train_iters)
+            save_training_checkpoint(cfg.train.train_iters)
         return
 
     set_moe_aux_loss_scale(grad_accum_steps, cfg.parallel.context_parallel_size)
@@ -2269,7 +2304,7 @@ def main() -> None:
             zero_training_gradients(model, optimizer, reset_grad_buffers=False)
 
         if cfg.train.save_interval > 0 and step % cfg.train.save_interval == 0:
-            maybe_save_checkpoint(cfg.train.output_dir, model, optimizer, lr_scheduler, step)
+            save_training_checkpoint(step)
 
     if val_iterator is not None and cfg.train.train_iters % cfg.train.eval_interval != 0:
         eval_t0 = time.perf_counter()
@@ -2278,7 +2313,7 @@ def main() -> None:
         zero_training_gradients(model, optimizer, reset_grad_buffers=False)
 
     if cfg.train.save_interval <= 0 or cfg.train.train_iters % cfg.train.save_interval != 0:
-        maybe_save_checkpoint(cfg.train.output_dir, model, optimizer, lr_scheduler, cfg.train.train_iters)
+        save_training_checkpoint(cfg.train.train_iters)
 
 
 if __name__ == "__main__":
